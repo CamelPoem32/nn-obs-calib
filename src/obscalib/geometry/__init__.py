@@ -18,7 +18,7 @@ from obscalib.geometry.maps import (
     SO3LogMap,
     VectorObservationMap,
 )
-from obscalib.geometry.processing import GeometryProcessor, transform_raw_measurements_to_world
+# from obscalib.geometry.processing import GeometryProcessor, transform_raw_measurements_to_world
 
 __all__ = [
     "GeometryMap",

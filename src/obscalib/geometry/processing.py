@@ -7,7 +7,7 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-from obscalib.calibration import CalibrationState
+from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import CanonicalSensorStreamBatch, GeometryType, SensorMetadata, SensorStreamBatch
 from obscalib.geometry.maps import SE3LogMap, SO3LogMap, VectorObservationMap
 

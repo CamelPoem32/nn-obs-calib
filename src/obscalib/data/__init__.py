@@ -1,6 +1,6 @@
 """Data contracts and deterministic sequence preprocessing."""
 
-from obscalib.calibration import CalibrationState
+from obscalib.calibration.state import CalibrationState
 from obscalib.data.collation import collate_windows
 from obscalib.data.sorting import sort_measurement_sequence
 from obscalib.data.structures import (

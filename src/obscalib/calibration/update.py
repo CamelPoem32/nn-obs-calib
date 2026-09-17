@@ -1,65 +1,64 @@
-"""Operations for advancing an externally carried calibration state."""
+"""Differentiable update of the externally carried calibration state."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from obscalib.calibration.state import CalibrationState
-from obscalib.geometry import se3_exp
+from obscalib.geometry.lie import se3_exp
 
 if TYPE_CHECKING:
     from obscalib.models.structures import CalibrationPrediction
 
 
 class CalibrationUpdater:
-    """Apply predicted left-multiplicative calibration corrections."""
+    """
+    Apply deterministic calibration corrections predicted by one model head.
 
-    def update(
-        self,
-        state: CalibrationState,
-        prediction: CalibrationPrediction,
-    ) -> CalibrationState:
-        """
-        Advance the carried spatial and temporal calibration state.
+    Spatial convention:
 
-        The spatial correction uses the established tangent convention
+        delta_xi = [phi, rho]
 
-            delta_xi = [phi, rho],
+        T_next = Exp_SE3(delta_xi) @ T_current.
 
-        where phi is the rotation-vector tangent component in radians and rho
-        is the translational tangent component of se(3).
+    Temporal convention:
 
-        The spatial correction is left-multiplicative:
+        tau_next = tau_current + delta_tau.
 
-            T_next = Exp_SE3(delta_xi) @ T_current.
+    change_event_logit and change_time are auxiliary supervised outputs and do
+    not gate application of delta_xi or delta_tau.
+    """
 
-        The temporal correction is additive:
-
-            tau_next = tau_current + delta_tau.
-
-        change_event_logit and change_time are auxiliary supervised outputs.
-        They do not gate or otherwise modify the calibration-state update.
-        """
+    def update(self, state: CalibrationState, prediction: CalibrationPrediction) -> CalibrationState:
+        """Return the next differentiable carried calibration state."""
 
         state.validate()
-        self._validate_prediction(state, prediction)
 
-        # Convert the predicted [phi, rho] tangent correction to SE(3).
-        # delta_transform: [B, 4, 4]
+        if prediction.delta_xi.ndim != 2 or prediction.delta_xi.shape[1] != 6:
+            raise ValueError("prediction.delta_xi must have shape [B, 6].")
+
+        if prediction.delta_tau.ndim != 2 or prediction.delta_tau.shape[1] != 1:
+            raise ValueError("prediction.delta_tau must have shape [B, 1].")
+
+        batch_size = state.transform.shape[0]
+
+        if prediction.delta_xi.shape[0] != batch_size or prediction.delta_tau.shape[0] != batch_size:
+            raise ValueError("Calibration state and prediction must share batch size.")
+
+        if prediction.delta_xi.device != state.transform.device or prediction.delta_tau.device != state.time_offset.device:
+            raise ValueError("Calibration state and prediction must be on the same device.")
+
+        if prediction.delta_xi.dtype != state.transform.dtype or prediction.delta_tau.dtype != state.time_offset.dtype:
+            raise ValueError("Calibration state and prediction must use matching dtypes.")
+
         delta_transform = se3_exp(prediction.delta_xi)
 
-        # Apply the correction on the left using the established convention.
-        # updated_transform: [B, 4, 4]
-        updated_transform = delta_transform @ state.transform
+        updated_state = CalibrationState(transform=delta_transform @ state.transform, time_offset=state.time_offset + prediction.delta_tau)
+        updated_state.validate()
 
-        # Apply the predicted additive temporal-offset correction.
-        # updated_time_offset: [B, 1]
-        updated_time_offset = state.time_offset + prediction.delta_tau
-
-        return CalibrationState(
-            transform=updated_transform,
-            time_offset=updated_time_offset,
-        )
+        return updated_state
 
     @staticmethod
     def _validate_prediction(
