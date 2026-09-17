@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 from torch import nn
 
-from obscalib.data.structures import ObservabilityResult
+from obscalib.observability.structures import ObservabilityResult
 
 
 class ObservabilityMapper(nn.Module, ABC):

@@ -8,11 +8,13 @@ from obscalib.observability.estimators import (
     SoftRankObservabilityEstimator,
 )
 from obscalib.observability.mappings import ObservabilityMapper
+from obscalib.observability.structures import ObservabilityResult
 
 __all__ = [
     "CRLBTanhObservabilityEstimator",
     "ObservabilityEstimator",
     "ObservabilityMapper",
+    "ObservabilityResult",
     "ObservabilityMatrixEstimator",
     "RawObservabilityEstimator",
     "SoftRankObservabilityEstimator",

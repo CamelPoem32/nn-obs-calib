@@ -7,10 +7,8 @@ from torch import nn
 
 from obscalib.calibration.state import CalibrationState
 
-from obscalib.data.structures import (
-    CanonicalMeasurements,
-    ObservabilityResult,
-)
+from obscalib.data.structures import CanonicalSensorStreamBatch
+from obscalib.observability.structures import ObservabilityResult
 
 
 class ObservabilityEstimator(nn.Module, ABC):
@@ -19,7 +17,7 @@ class ObservabilityEstimator(nn.Module, ABC):
     @abstractmethod
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: Mapping[str, CanonicalSensorStreamBatch],
         calibration: Mapping[str, CalibrationState],
     ) -> ObservabilityResult:
         """Return a scientific result whose raw structure may be strategy-specific."""
@@ -30,7 +28,7 @@ class ObservabilityMatrixEstimator(ObservabilityEstimator):
 
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: Mapping[str, CanonicalSensorStreamBatch],
         calibration: Mapping[str, CalibrationState],
     ) -> ObservabilityResult:
         """Compute a matrix-derived raw result after validated code is ported."""
@@ -44,7 +42,7 @@ class SoftRankObservabilityEstimator(ObservabilityEstimator):
 
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: Mapping[str, CanonicalSensorStreamBatch],
         calibration: Mapping[str, CalibrationState],
     ) -> ObservabilityResult:
         """Compute a raw soft-rank result once its definition is specified."""
@@ -64,7 +62,7 @@ class CRLBTanhObservabilityEstimator(ObservabilityEstimator):
 
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: Mapping[str, CanonicalSensorStreamBatch],
         calibration: Mapping[str, CalibrationState],
     ) -> ObservabilityResult:
         """Compute CRLB features after the uncertainty pipeline is specified."""
@@ -80,7 +78,7 @@ class RawObservabilityEstimator(ObservabilityEstimator):
 
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: Mapping[str, CanonicalSensorStreamBatch],
         calibration: Mapping[str, CalibrationState],
     ) -> ObservabilityResult:
         """Return a raw result after its scientific contract is specified."""

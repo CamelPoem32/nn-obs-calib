@@ -116,3 +116,37 @@ class ObsCalibModelConfig:
         """Feature size emitted by the shared MLP for every calibration head."""
 
         return self.mlp.output_dim
+
+@dataclass(frozen=True)
+class MeasurementEncoderConfig:
+    """Configuration for sensor-type-specific measurement projections."""
+
+    d_measurement: int = 6
+
+    def __post_init__(self) -> None:
+        _validate_positive("d_measurement", self.d_measurement)
+
+@dataclass(frozen=True)
+class WindowingConfig:
+    """Configuration for temporal sensor-stream window construction."""
+
+    window_duration_s: float = 5.0
+    window_stride_s: float | None = None
+    max_samples_per_sensor: int = 700
+
+    def __post_init__(self) -> None:
+        if self.window_duration_s <= 0.0:
+            raise ValueError(f"window_duration_s must be positive, got {self.window_duration_s}.")
+
+        if self.window_stride_s is not None and self.window_stride_s <= 0.0:
+            raise ValueError(f"window_stride_s must be positive when provided, got {self.window_stride_s}.")
+
+        if self.max_samples_per_sensor <= 0:
+            raise ValueError(f"max_samples_per_sensor must be positive, got {self.max_samples_per_sensor}.")
+
+    @property
+    def resolved_window_stride_s(self) -> float:
+        """Use non-overlapping windows when no explicit stride is configured."""
+
+        return self.window_duration_s if self.window_stride_s is None else self.window_stride_s
+

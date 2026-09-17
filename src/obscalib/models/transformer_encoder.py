@@ -77,9 +77,9 @@ class SummaryTokenTransformerEncoder(nn.Module):
             batch_size,
             self.config.num_summary_tokens,
             dtype=torch.bool,
-            device=tokens.valid_mask.device,
+            device=tokens.token_mask.device,
         )
-        padding_mask = torch.cat((~tokens.valid_mask, summary_padding), dim=1)
+        padding_mask = torch.cat((~tokens.token_mask, summary_padding), dim=1)
 
         # sequence: [B, N + K, d_model]
         sequence = self.encoder(

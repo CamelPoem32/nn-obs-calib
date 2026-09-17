@@ -4,10 +4,10 @@ import torch
 from torch import nn
 
 from obscalib.data.structures import (
-    CanonicalMeasurements,
-    ObservabilityResult,
+    MeasurementSequenceBatch,
     TokenBatch,
 )
+from obscalib.observability.structures import ObservabilityResult
 from obscalib.tokenization.measurement_encoder import MeasurementEncoder
 from obscalib.tokenization.metadata_encoder import MetadataEncoder
 from obscalib.tokenization.time_encoder import TimeEncoder
@@ -49,7 +49,7 @@ class Tokenizer(nn.Module):
 
     def forward(
         self,
-        measurements: CanonicalMeasurements,
+        measurements: MeasurementSequenceBatch,
         observability: ObservabilityResult,
     ) -> TokenBatch:
         """Build tokens without geometry conversion, sorting, or estimation."""
@@ -61,7 +61,7 @@ class Tokenizer(nn.Module):
                 "observability features must be produced by an ObservabilityMapper."
             )
 
-        expected_prefix = (*measurements.values.shape[:2], self.observability_dim)
+        expected_prefix = (*measurements.features.shape[:2], self.observability_dim)
         if features.shape != expected_prefix:
             raise ValueError(
                 "observability.features must have shape "
@@ -69,9 +69,9 @@ class Tokenizer(nn.Module):
             )
 
         # Encode each concept separately so future ablations remain local.
-        measurement_features = self.measurement_encoder(measurements.values)
+        measurement_features = self.measurement_encoder(measurements.features)
         metadata_features = self.metadata_encoder(
-            measurements.sensor_ids, measurements.type_ids
+            measurements.sensor_ids, measurements.measurement_types
         )
         time_features = self.time_encoder(measurements.timestamps)
 
@@ -88,7 +88,7 @@ class Tokenizer(nn.Module):
         x = self.output_projection(concatenated)
         return TokenBatch(
             x=x,
-            valid_mask=measurements.valid_mask,
+            token_mask=measurements.token_mask,
             sensor_ids=measurements.sensor_ids,
-            type_ids=measurements.type_ids,
+            measurement_types=measurements.measurement_types,
         )

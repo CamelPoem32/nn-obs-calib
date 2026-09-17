@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from obscalib.data import CanonicalMeasurements, ObservabilityResult
+from obscalib.data import MeasurementSequenceBatch
+from obscalib.observability import ObservabilityResult
 from obscalib.tokenization import (
     MeasurementEncoder,
     MetadataEncoder,
@@ -18,12 +19,12 @@ def test_tokenizer_concatenates_and_projects_prepared_features() -> None:
         observability_dim=3,
         output_dim=7,
     )
-    measurements = CanonicalMeasurements(
-        values=torch.randn(2, 5, 3),
+    measurements = MeasurementSequenceBatch(
+        features=torch.randn(2, 5, 3),
         timestamps=torch.randn(2, 5),
         sensor_ids=torch.randint(0, 4, (2, 5)),
-        type_ids=torch.randint(0, 3, (2, 5)),
-        valid_mask=torch.tensor(
+        measurement_types=torch.randint(0, 3, (2, 5)),
+        token_mask=torch.tensor(
             [[True, True, True, False, False], [True, True, True, True, True]]
         ),
     )
@@ -32,9 +33,9 @@ def test_tokenizer_concatenates_and_projects_prepared_features() -> None:
     tokens = tokenizer(measurements, observability)
 
     assert tokens.x.shape == (2, 5, 7)
-    assert torch.equal(tokens.valid_mask, measurements.valid_mask)
+    assert torch.equal(tokens.token_mask, measurements.token_mask)
     assert torch.equal(tokens.sensor_ids, measurements.sensor_ids)
-    assert torch.equal(tokens.type_ids, measurements.type_ids)
+    assert torch.equal(tokens.measurement_types, measurements.measurement_types)
 
 
 def test_tokenizer_requires_nn_ready_observability_features() -> None:
@@ -44,12 +45,12 @@ def test_tokenizer_requires_nn_ready_observability_features() -> None:
         time_encoder=TimeEncoder(2),
         observability_dim=1,
     )
-    measurements = CanonicalMeasurements(
-        values=torch.randn(1, 2, 2),
+    measurements = MeasurementSequenceBatch(
+        features=torch.randn(1, 2, 2),
         timestamps=torch.randn(1, 2),
         sensor_ids=torch.zeros(1, 2, dtype=torch.long),
-        type_ids=torch.zeros(1, 2, dtype=torch.long),
-        valid_mask=torch.ones(1, 2, dtype=torch.bool),
+        measurement_types=torch.zeros(1, 2, dtype=torch.long),
+        token_mask=torch.ones(1, 2, dtype=torch.bool),
     )
     observability = ObservabilityResult(raw={"matrix": torch.eye(2)})
 

@@ -14,7 +14,7 @@ class LossComponents:
     rotation: torch.Tensor
     translation: torch.Tensor
     time_offset: torch.Tensor
-    change: torch.Tensor
+    change_event: torch.Tensor
     change_time: torch.Tensor
     prior: torch.Tensor
     consistency: torch.Tensor
@@ -31,7 +31,7 @@ def combine_loss_components(
         weights.lambda_rotation * components.rotation
         + weights.lambda_translation * components.translation
         + weights.lambda_time_offset * components.time_offset
-        + weights.lambda_change * components.change
+        + weights.lambda_change * components.change_event
         + weights.lambda_change_time * components.change_time
         + weights.lambda_prior * components.prior
         + weights.lambda_consistency * components.consistency

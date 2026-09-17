@@ -10,11 +10,11 @@ from obscalib.models import SummaryTokenTransformerEncoder
 def make_tokens() -> TokenBatch:
     return TokenBatch(
         x=torch.randn(2, 4, 5),
-        valid_mask=torch.tensor(
+        token_mask=torch.tensor(
             [[True, True, False, False], [True, True, True, False]]
         ),
         sensor_ids=torch.zeros(2, 4, dtype=torch.long),
-        type_ids=torch.zeros(2, 4, dtype=torch.long),
+        measurement_types=torch.zeros(2, 4, dtype=torch.long),
     )
 
 
@@ -68,5 +68,5 @@ def test_transformer_extends_padding_mask_for_always_valid_summaries() -> None:
 
     assert capture.padding_mask is not None
     assert capture.padding_mask.shape == (2, 7)
-    assert torch.equal(capture.padding_mask[:, :4], ~make_tokens().valid_mask)
+    assert torch.equal(capture.padding_mask[:, :4], ~make_tokens().token_mask)
     assert not capture.padding_mask[:, 4:].any()

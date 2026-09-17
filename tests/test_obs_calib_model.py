@@ -47,11 +47,11 @@ def test_complete_learned_path_shapes_derived_dimensions_and_gradients() -> None
 
     tokens = TokenBatch(
         x=torch.randn(batch_size, 6, 5, requires_grad=True),
-        valid_mask=torch.tensor(
+        token_mask=torch.tensor(
             [[True, True, True, False, False, False], [True] * 6]
         ),
         sensor_ids=torch.zeros(batch_size, 6, dtype=torch.long),
-        type_ids=torch.zeros(batch_size, 6, dtype=torch.long),
+        measurement_types=torch.zeros(batch_size, 6, dtype=torch.long),
     )
     calibration_context = {
         "imu": torch.randn(batch_size, 4),

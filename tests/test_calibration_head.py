@@ -51,9 +51,9 @@ def test_model_builds_and_evaluates_multiple_module_dict_heads() -> None:
     )
     tokens = TokenBatch(
         x=torch.randn(3, 6, 5),
-        valid_mask=torch.ones(3, 6, dtype=torch.bool),
+        token_mask=torch.ones(3, 6, dtype=torch.bool),
         sensor_ids=torch.zeros(3, 6, dtype=torch.long),
-        type_ids=torch.zeros(3, 6, dtype=torch.long),
+        measurement_types=torch.zeros(3, 6, dtype=torch.long),
     )
 
     output = model(
