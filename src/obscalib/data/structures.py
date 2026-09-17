@@ -12,10 +12,11 @@ from obscalib.calibration.state import CalibrationState
 
 class MeasurementType(IntEnum):
     """
-    Semantic type of one measurement stream.
+    Semantic physical measurement type.
 
-    Values are contiguous so they can be stored directly in tensors and used
-    as indices for learned measurement-type embeddings.
+    Its integer value is concatenated directly to each Transformer token.
+    Different physical realizations of the same modality deliberately share
+    the same value.
     """
 
     IMU_GYROSCOPE = 0
@@ -23,6 +24,7 @@ class MeasurementType(IntEnum):
     LIDAR_POSE = 2
     CAMERA_POSE = 3
     GPS_POSITION = 4
+    RADAR_DETECTION = 5
 
 
 class GeometryType(str, Enum):
@@ -33,14 +35,11 @@ class GeometryType(str, Enum):
     SE3 = "se3"
 
 
-def _validate_unbatched_sequence_fields(
-    values: torch.Tensor,
-    timestamps: torch.Tensor,
-) -> None:
+def _validate_unbatched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor) -> None:
     """Validate an unbatched variable-length sensor sequence."""
 
-    if values.ndim != 2:
-        raise ValueError("values must have shape [N, D].")
+    if values.ndim < 2:
+        raise ValueError("values must have shape [N, ...].")
 
     if timestamps.ndim != 1:
         raise ValueError("timestamps must have shape [N].")
@@ -58,15 +57,11 @@ def _validate_unbatched_sequence_fields(
         raise ValueError("values and timestamps must be on the same device.")
 
 
-def _validate_batched_sequence_fields(
-    values: torch.Tensor,
-    timestamps: torch.Tensor,
-    sample_mask: torch.Tensor,
-) -> None:
+def _validate_batched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor, sample_mask: torch.Tensor) -> None:
     """Validate a padded batch of variable-length sensor sequences."""
 
-    if values.ndim != 3:
-        raise ValueError("values must have shape [B, N, D].")
+    if values.ndim < 3:
+        raise ValueError("values must have shape [B, N, ...].")
 
     if timestamps.ndim != 2:
         raise ValueError("timestamps must have shape [B, N].")
@@ -89,14 +84,8 @@ def _validate_batched_sequence_fields(
     if sample_mask.dtype != torch.bool:
         raise TypeError("sample_mask must have boolean dtype.")
 
-    if not (
-        values.device
-        == timestamps.device
-        == sample_mask.device
-    ):
-        raise ValueError(
-            "values, timestamps, and sample_mask must be on the same device."
-        )
+    if not (values.device == timestamps.device == sample_mask.device):
+        raise ValueError("values, timestamps, and sample_mask must be on the same device.")
 
 
 @dataclass
@@ -168,25 +157,32 @@ class SensorStreamBatch:
         )
 
 
+
+
 @dataclass(frozen=True)
 class SensorMetadata:
     """
-    Stable identity and representation metadata for one sensor stream.
+    Processing metadata for one raw sensor stream.
 
-    measurement_type serves both as the semantic stream type used to select a
-    type-specific encoder and, through its integer value, as the type index
-    used by learned metadata embeddings.
+    measurement_type:
+        Physical sensor modality. Its integer value is concatenated directly to
+        the final Transformer token.
+
+    geometry_type:
+        Mathematical representation used by the geometry preprocessing block.
+
+    calibration_key:
+        Internal key selecting T_sensor_in_world for this physical sensor.
+        This key is used only for preprocessing and is never exposed to the
+        Transformer.
+
+        Multiple streams may share one calibration key, for example the
+        gyroscope and accelerometer belonging to the same IMU.
     """
 
-    sensor_id: int
     measurement_type: MeasurementType
     geometry_type: GeometryType
-
-    @property
-    def type_index(self) -> int:
-        """Return the contiguous integer code used for tensor embeddings."""
-
-        return int(self.measurement_type)
+    calibration_key: str
 
 
 @dataclass
@@ -194,10 +190,19 @@ class CalibrationTarget:
     """
     Unbatched supervision associated with the next calibration state.
 
-    All times are measured relative to the beginning of the current window.
+    next_transform:
+        Ground-truth next calibration transform with shape [4, 4].
 
-    change_time is meaningful only when change_label is one. Its loss must be
-    masked out for no-change samples.
+    next_time_offset:
+        Ground-truth next calibration time offset with shape [1].
+
+    change_label:
+        Binary change-event target with shape [1].
+
+    change_time:
+        Change time in seconds relative to the beginning of the current window,
+        with shape [1]. The value is ignored by the loss when change_label is
+        zero.
     """
 
     next_transform: torch.Tensor | None = None
@@ -205,15 +210,76 @@ class CalibrationTarget:
     change_label: torch.Tensor | None = None
     change_time: torch.Tensor | None = None
 
+    def validate(self) -> None:
+        """Validate all target fields that are currently populated."""
+
+        if self.next_transform is not None and self.next_transform.shape != (4, 4):
+            raise ValueError("next_transform must have shape [4, 4].")
+
+        if self.next_time_offset is not None and self.next_time_offset.shape != (1,):
+            raise ValueError("next_time_offset must have shape [1].")
+
+        if self.change_label is not None and self.change_label.shape != (1,):
+            raise ValueError("change_label must have shape [1].")
+
+        if self.change_time is not None and self.change_time.shape != (1,):
+            raise ValueError("change_time must have shape [1].")
+
 
 @dataclass
 class CalibrationTargetBatch:
-    """Batched version of CalibrationTarget produced during collation."""
+    """
+    Batched calibration supervision.
+
+    next_transform:
+        [B, 4, 4]
+
+    next_time_offset:
+        [B, 1]
+
+    change_label:
+        [B, 1]
+
+    change_time:
+        [B, 1], measured in seconds relative to each window start.
+    """
 
     next_transform: torch.Tensor | None = None
     next_time_offset: torch.Tensor | None = None
     change_label: torch.Tensor | None = None
     change_time: torch.Tensor | None = None
+
+    def validate(self) -> None:
+        """Validate shapes and batch agreement of all populated target fields."""
+
+        batch_sizes: list[int] = []
+
+        if self.next_transform is not None:
+            if self.next_transform.ndim != 3 or self.next_transform.shape[-2:] != (4, 4):
+                raise ValueError("next_transform must have shape [B, 4, 4].")
+
+            batch_sizes.append(self.next_transform.shape[0])
+
+        if self.next_time_offset is not None:
+            if self.next_time_offset.ndim != 2 or self.next_time_offset.shape[1] != 1:
+                raise ValueError("next_time_offset must have shape [B, 1].")
+
+            batch_sizes.append(self.next_time_offset.shape[0])
+
+        if self.change_label is not None:
+            if self.change_label.ndim != 2 or self.change_label.shape[1] != 1:
+                raise ValueError("change_label must have shape [B, 1].")
+
+            batch_sizes.append(self.change_label.shape[0])
+
+        if self.change_time is not None:
+            if self.change_time.ndim != 2 or self.change_time.shape[1] != 1:
+                raise ValueError("change_time must have shape [B, 1].")
+
+            batch_sizes.append(self.change_time.shape[0])
+
+        if batch_sizes and any(batch_size != batch_sizes[0] for batch_size in batch_sizes[1:]):
+            raise ValueError("All populated calibration target fields must share batch size.")
 
 
 @dataclass
@@ -255,20 +321,30 @@ class WindowBatch:
 @dataclass
 class CanonicalSensorStreamBatch:
     """
-    Geometry-mapped stream retaining its native canonical feature dimension.
+    One sensor stream after calibration-prior transformation and geometry mapping.
 
-    Examples:
+    values:
+        Canonical vector-valued measurements with shape [B, N_s, d_s].
 
-        SE(3) -> [phi, rho] : D = 6
-        SO(3) -> phi        : D = 3
-        vector observation  : D = original vector dimension
+        Examples:
+            gyro / accelerometer -> [B, N_s, 3]
+            SO(3) update         -> [B, N_s, 3]
+            SE(3) update         -> [B, N_s, 6]
 
-    Different sensor streams are deliberately allowed to have different D.
+    timestamps:
+        Relative timestamps with shape [B, N_s].
+
+    sample_mask:
+        True for real samples and False for collation padding.
+
+    measurement_type:
+        Physical measurement type used to select the learned encoder.
     """
 
     values: torch.Tensor
     timestamps: torch.Tensor
     sample_mask: torch.Tensor
+    measurement_type: MeasurementType
 
     def validate(self) -> None:
         """Validate the geometry-mapped padded sequence."""
@@ -278,129 +354,96 @@ class CanonicalSensorStreamBatch:
             self.timestamps,
             self.sample_mask,
         )
+        if self.values.ndim != 3:
+            raise ValueError("Canonical values must have shape [B, N, D].")
+
+@dataclass
+class EncodedSensorStreamBatch:
+    """
+    One sensor stream after its type-specific learned measurement encoder.
+
+    features:
+        [B, N_s, d_measurement]
+
+    timestamps:
+        [B, N_s], measured in seconds relative to the current window start.
+
+    sample_mask:
+        [B, N_s], True for real measurements and False for padding.
+
+    measurement_type:
+        Physical sensor type shared by every measurement in this stream.
+
+    Every sensor-specific encoder produces the same configurable
+    d_measurement, allowing streams to be concatenated afterward.
+    """
+
+    features: torch.Tensor
+    timestamps: torch.Tensor
+    sample_mask: torch.Tensor
+    measurement_type: MeasurementType
+
+    def validate(self) -> None:
+        """Validate one encoded sensor stream."""
+
+        _validate_batched_sequence_fields(self.features, self.timestamps, self.sample_mask)
 
 
 @dataclass
 class MeasurementSequenceBatch:
     """
-    Merged sequence after type-specific measurement encoding.
+    Concatenated, not necessarily time-sorted Transformer-input sequence.
 
-    All sensor streams have already been projected to the common learned
-    measurement width d_measurement before entering this structure.
+    x already contains the complete per-measurement feature vector
 
-    features:
-        [B, N, d_measurement]
+        [measurement | timestamp | measurement type | optional observability].
 
-    timestamps:
-        [B, N]
-
-    sensor_ids:
-        [B, N]
-
-    measurement_types:
-        Integer MeasurementType values with shape [B, N].
-
-    token_mask:
-        [B, N], True for real measurement tokens and False for padding.
+    timestamps is retained separately only so the complete x vectors can be
+    sorted chronologically after all streams have been concatenated.
     """
 
-    features: torch.Tensor
+    x: torch.Tensor
     timestamps: torch.Tensor
-    sensor_ids: torch.Tensor
-    measurement_types: torch.Tensor
     token_mask: torch.Tensor
 
     def validate(self) -> None:
-        """Validate the merged common-width measurement sequence."""
+        """Validate the concatenated sequence."""
 
-        _validate_batched_sequence_fields(
-            self.features,
-            self.timestamps,
-            self.token_mask,
-        )
-
-        expected_shape = self.timestamps.shape
-
-        if self.sensor_ids.shape != expected_shape:
-            raise ValueError("sensor_ids must have shape [B, N].")
-
-        if self.measurement_types.shape != expected_shape:
-            raise ValueError(
-                "measurement_types must have shape [B, N]."
-            )
-
-        if self.sensor_ids.dtype != torch.long:
-            raise TypeError("sensor_ids must have dtype torch.long.")
-
-        if self.measurement_types.dtype != torch.long:
-            raise TypeError(
-                "measurement_types must have dtype torch.long."
-            )
-
-        real_measurement_types = self.measurement_types[self.token_mask]
-
-        if real_measurement_types.numel() > 0:
-            min_type = int(real_measurement_types.min())
-            max_type = int(real_measurement_types.max())
-
-            if min_type < 0 or max_type >= len(MeasurementType):
-                raise ValueError(
-                    "measurement_types contains an unknown MeasurementType index."
-            )
-
-        if torch.any(
-            ~torch.isfinite(
-                self.timestamps[self.token_mask]
-            )
-        ):
-            raise ValueError(
-                "timestamps must be finite for real measurement tokens."
-            )
+        _validate_batched_sequence_fields(self.x, self.timestamps, self.token_mask)
 
 
 @dataclass
 class TokenBatch:
     """
-    Prepared Transformer token sequence.
+    Final Transformer token sequence.
 
     x:
         [B, N, d_x]
 
+        with feature ordering
+
+            [measurement | relative timestamp | measurement type | observability]
+
+        where the observability block is absent when observability is disabled.
+
     token_mask:
-        [B, N], True for real tokens and False for padded positions.
+        [B, N], True for real tokens and False for padding.
     """
 
     x: torch.Tensor
     token_mask: torch.Tensor
-    sensor_ids: torch.Tensor
-    measurement_types: torch.Tensor
 
     def validate(self) -> None:
-        """Validate aligned token and metadata sequence dimensions."""
+        """Validate final Transformer tokens."""
 
         if self.x.ndim != 3:
             raise ValueError("x must have shape [B, N, d_x].")
 
-        expected_shape = self.x.shape[:2]
-
-        if self.token_mask.shape != expected_shape:
+        if self.token_mask.shape != self.x.shape[:2]:
             raise ValueError("token_mask must have shape [B, N].")
-
-        if self.sensor_ids.shape != expected_shape:
-            raise ValueError("sensor_ids must have shape [B, N].")
-
-        if self.measurement_types.shape != expected_shape:
-            raise ValueError(
-                "measurement_types must have shape [B, N]."
-            )
 
         if self.token_mask.dtype != torch.bool:
             raise TypeError("token_mask must have boolean dtype.")
 
-        if self.sensor_ids.dtype != torch.long:
-            raise TypeError("sensor_ids must have dtype torch.long.")
-
-        if self.measurement_types.dtype != torch.long:
-            raise TypeError(
-                "measurement_types must have dtype torch.long."
-            )
+        if self.token_mask.device != self.x.device:
+            raise ValueError("token_mask and x must be on the same device.")

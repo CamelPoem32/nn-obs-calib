@@ -17,6 +17,7 @@ from obscalib.data.structures import (
     TokenBatch,
     WindowBatch,
     WindowSample,
+    EncodedSensorStreamBatch,
 )
 from obscalib.data.windowing import build_windows
 
@@ -38,4 +39,5 @@ __all__ = [
     "WindowSample",
     "collate_windows",
     "sort_measurement_sequence",
+    "EncodedSensorStreamBatch",
 ]

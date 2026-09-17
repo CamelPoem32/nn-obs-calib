@@ -36,10 +36,8 @@ def _require_same_keys(
     return reference_keys
 
 
-def _collate_sensor_streams(
-    streams: Sequence[SensorStream],
-) -> SensorStreamBatch:
-    """Pad one sensor independently to the longest stream in this minibatch."""
+def _collate_sensor_streams(streams: Sequence[SensorStream]) -> SensorStreamBatch:
+    """Pad one raw sensor independently while preserving its native measurement shape."""
 
     if not streams:
         raise ValueError("Cannot collate an empty sensor-stream sequence.")
@@ -47,73 +45,38 @@ def _collate_sensor_streams(
     for stream in streams:
         stream.validate()
 
-    feature_dim = streams[0].values.shape[-1]
+    sample_shape = streams[0].values.shape[1:]
     dtype = streams[0].values.dtype
     device = streams[0].values.device
     timestamp_dtype = streams[0].timestamps.dtype
 
     for stream in streams[1:]:
-        if stream.values.shape[-1] != feature_dim:
-            raise ValueError(
-                "The same sensor stream must have one feature dimension "
-                "throughout a minibatch."
-            )
+        if stream.values.shape[1:] != sample_shape:
+            raise ValueError("The same sensor stream must have one measurement shape throughout a minibatch.")
 
         if stream.values.dtype != dtype:
-            raise ValueError(
-                "The same sensor stream must have one values dtype "
-                "throughout a minibatch."
-            )
+            raise ValueError("The same sensor stream must have one values dtype throughout a minibatch.")
 
         if stream.timestamps.dtype != timestamp_dtype:
-            raise ValueError(
-                "The same sensor stream must have one timestamp dtype "
-                "throughout a minibatch."
-            )
+            raise ValueError("The same sensor stream must have one timestamp dtype throughout a minibatch.")
 
-        if stream.values.device != device:
-            raise ValueError(
-                "The same sensor stream must be on one device throughout "
-                "a minibatch."
-            )
+        if stream.values.device != device or stream.timestamps.device != device:
+            raise ValueError("The same sensor stream must be on one device throughout a minibatch.")
 
     batch_size = len(streams)
     max_samples = max(stream.values.shape[0] for stream in streams)
 
-    # Each sensor is padded only to its own minibatch maximum. Padding values
-    # are arbitrary because sample_mask prevents them from becoming tokens.
-    values = torch.zeros(
-        batch_size,
-        max_samples,
-        feature_dim,
-        dtype=dtype,
-        device=device,
-    )
-    timestamps = torch.zeros(
-        batch_size,
-        max_samples,
-        dtype=timestamp_dtype,
-        device=device,
-    )
-    sample_mask = torch.zeros(
-        batch_size,
-        max_samples,
-        dtype=torch.bool,
-        device=device,
-    )
+    values = torch.zeros((batch_size, max_samples, *sample_shape), dtype=dtype, device=device)
+    timestamps = torch.zeros((batch_size, max_samples), dtype=timestamp_dtype, device=device)
+    sample_mask = torch.zeros((batch_size, max_samples), dtype=torch.bool, device=device)
 
     for batch_index, stream in enumerate(streams):
         num_samples = stream.values.shape[0]
-
         values[batch_index, :num_samples] = stream.values
         timestamps[batch_index, :num_samples] = stream.timestamps
         sample_mask[batch_index, :num_samples] = True
 
-    return SensorStreamBatch(
-        values=values,
-        timestamps=timestamps,
-        sample_mask=sample_mask,
-    )
+    return SensorStreamBatch(values=values, timestamps=timestamps, sample_mask=sample_mask)
 
 
 def _collate_calibration_states(

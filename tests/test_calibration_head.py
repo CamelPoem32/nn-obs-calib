@@ -21,7 +21,7 @@ def test_calibration_head_named_output_shapes() -> None:
 
     prediction = head(torch.randn(3, 10), torch.randn(3, 4))
 
-    assert prediction.change_logit.shape == (3, 1)
+    assert prediction.change_event_logit.shape == (3, 1)
     assert prediction.change_time.shape == (3, 1)
     assert prediction.delta_xi.shape == (3, 6)
     assert prediction.delta_tau.shape == (3, 1)
@@ -49,12 +49,7 @@ def test_model_builds_and_evaluates_multiple_module_dict_heads() -> None:
             head_keys=("imu", "camera"),
         )
     )
-    tokens = TokenBatch(
-        x=torch.randn(3, 6, 5),
-        token_mask=torch.ones(3, 6, dtype=torch.bool),
-        sensor_ids=torch.zeros(3, 6, dtype=torch.long),
-        measurement_types=torch.zeros(3, 6, dtype=torch.long),
-    )
+    tokens = TokenBatch(x=torch.randn(3, 6, 5), token_mask=torch.ones(3, 6, dtype=torch.bool))
 
     output = model(
         tokens,

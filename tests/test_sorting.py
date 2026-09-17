@@ -1,77 +1,79 @@
-"""Tests for chronological sorting of encoded measurement sequences."""
+"""Tests for chronological sorting of complete measurement-token vectors."""
 
 import torch
 
-from obscalib.data import MeasurementSequenceBatch, sort_measurement_sequence
+from obscalib.data.sorting import sort_measurement_sequence
+from obscalib.data.structures import MeasurementSequenceBatch
 
 
 def test_sort_measurement_sequence_orders_valid_tokens_by_time() -> None:
     measurements = MeasurementSequenceBatch(
-        features=torch.tensor([[[30.0, 31.0], [10.0, 11.0], [20.0, 21.0]]]),
+        x=torch.tensor([[[30.0, 31.0, 3.0, 2.0], [10.0, 11.0, 1.0, 0.0], [20.0, 21.0, 2.0, 1.0]]]),
         timestamps=torch.tensor([[3.0, 1.0, 2.0]]),
-        sensor_ids=torch.tensor([[3, 1, 2]], dtype=torch.long),
-        measurement_types=torch.tensor([[2, 0, 1]], dtype=torch.long),
         token_mask=torch.tensor([[True, True, True]]),
     )
 
     sorted_measurements = sort_measurement_sequence(measurements)
 
     torch.testing.assert_close(sorted_measurements.timestamps, torch.tensor([[1.0, 2.0, 3.0]]))
-    torch.testing.assert_close(sorted_measurements.features, torch.tensor([[[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]]))
-    torch.testing.assert_close(sorted_measurements.sensor_ids, torch.tensor([[1, 2, 3]], dtype=torch.long))
-    torch.testing.assert_close(sorted_measurements.measurement_types, torch.tensor([[0, 1, 2]], dtype=torch.long))
+    torch.testing.assert_close(sorted_measurements.x, torch.tensor([[[10.0, 11.0, 1.0, 0.0], [20.0, 21.0, 2.0, 1.0], [30.0, 31.0, 3.0, 2.0]]]))
+    assert torch.equal(sorted_measurements.token_mask, torch.tensor([[True, True, True]]))
 
 
 def test_sort_measurement_sequence_moves_padding_to_end() -> None:
     measurements = MeasurementSequenceBatch(
-        features=torch.tensor([[[20.0], [999.0], [10.0], [998.0]]]),
+        x=torch.tensor([[[20.0], [999.0], [10.0], [998.0]]]),
         timestamps=torch.tensor([[2.0, -100.0, 1.0, -200.0]]),
-        sensor_ids=torch.tensor([[2, 99, 1, 98]], dtype=torch.long),
-        measurement_types=torch.tensor([[1, 4, 0, 4]], dtype=torch.long),
         token_mask=torch.tensor([[True, False, True, False]]),
     )
 
     sorted_measurements = sort_measurement_sequence(measurements)
 
-    torch.testing.assert_close(sorted_measurements.timestamps, torch.tensor([[1.0, 2.0, -100.0, -200.0]]))
     assert torch.equal(sorted_measurements.token_mask, torch.tensor([[True, True, False, False]]))
-    torch.testing.assert_close(sorted_measurements.features[..., 0], torch.tensor([[10.0, 20.0, 999.0, 998.0]]))
+
+    # Valid measurements are sorted chronologically.
+    torch.testing.assert_close(sorted_measurements.x[0, :2], torch.tensor([[10.0], [20.0]]))
+    torch.testing.assert_close(sorted_measurements.timestamps[0, :2], torch.tensor([1.0, 2.0]))
+
+    # Padding is moved behind all real measurements.
+    # Stable sorting keeps the original relative order of padding entries.
+    torch.testing.assert_close(sorted_measurements.x[0, 2:], torch.tensor([[999.0], [998.0]]))
 
 
 def test_sort_measurement_sequence_is_stable_for_equal_timestamps() -> None:
     measurements = MeasurementSequenceBatch(
-        features=torch.tensor([[[1.0], [2.0], [3.0]]]),
+        x=torch.tensor([[[1.0], [2.0], [3.0]]]),
         timestamps=torch.tensor([[1.0, 1.0, 1.0]]),
-        sensor_ids=torch.tensor([[0, 1, 2]], dtype=torch.long),
-        measurement_types=torch.tensor([[0, 1, 2]], dtype=torch.long),
         token_mask=torch.tensor([[True, True, True]]),
     )
 
     sorted_measurements = sort_measurement_sequence(measurements)
 
-    torch.testing.assert_close(sorted_measurements.features, measurements.features)
-    assert torch.equal(sorted_measurements.sensor_ids, measurements.sensor_ids)
+    torch.testing.assert_close(sorted_measurements.x, measurements.x)
+    torch.testing.assert_close(sorted_measurements.timestamps, measurements.timestamps)
+    assert torch.equal(sorted_measurements.token_mask, measurements.token_mask)
 
 
-def test_sorting_preserves_gradient_to_measurement_features() -> None:
-    features = torch.tensor([[[3.0], [1.0], [2.0]]], requires_grad=True)
+def test_sorting_preserves_gradient_to_complete_token_vectors() -> None:
+    x = torch.tensor([[[3.0], [1.0], [2.0]]], requires_grad=True)
 
     measurements = MeasurementSequenceBatch(
-        features=features,
+        x=x,
         timestamps=torch.tensor([[3.0, 1.0, 2.0]]),
-        sensor_ids=torch.zeros(1, 3, dtype=torch.long),
-        measurement_types=torch.zeros(1, 3, dtype=torch.long),
         token_mask=torch.ones(1, 3, dtype=torch.bool),
     )
 
     sorted_measurements = sort_measurement_sequence(measurements)
 
-    weights = torch.tensor([[[1.0], [2.0], [3.0]]])
-    loss = (sorted_measurements.features * weights).sum()
+    torch.testing.assert_close(sorted_measurements.x, torch.tensor([[[1.0], [2.0], [3.0]]]))
+
+    # Different coefficients make the expected inverse permutation visible in
+    # the gradient rather than merely checking that some gradient exists.
+    loss = 10.0 * sorted_measurements.x[0, 0, 0] + 20.0 * sorted_measurements.x[0, 1, 0] + 30.0 * sorted_measurements.x[0, 2, 0]
     loss.backward()
 
-    assert features.grad is not None
-    assert torch.isfinite(features.grad).all()
+    assert x.grad is not None
 
-    # Original positions correspond to timestamps [3, 1, 2], so the gradients from sorted positions [1, 2, 3] return as [3, 1, 2].
-    torch.testing.assert_close(features.grad, torch.tensor([[[3.0], [1.0], [2.0]]]))
+    # Original order was [t=3, t=1, t=2], so sorted coefficients [10,20,30]
+    # map back to original entries as [30,10,20].
+    torch.testing.assert_close(x.grad, torch.tensor([[[30.0], [10.0], [20.0]]]))

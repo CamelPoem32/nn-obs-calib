@@ -45,14 +45,7 @@ def test_complete_learned_path_shapes_derived_dimensions_and_gradients() -> None
     assert model.mlp_body.input_dim == 24
     assert all(head.shared_feature_dim == 10 for head in model.heads.values())
 
-    tokens = TokenBatch(
-        x=torch.randn(batch_size, 6, 5, requires_grad=True),
-        token_mask=torch.tensor(
-            [[True, True, True, False, False, False], [True] * 6]
-        ),
-        sensor_ids=torch.zeros(batch_size, 6, dtype=torch.long),
-        measurement_types=torch.zeros(batch_size, 6, dtype=torch.long),
-    )
+    tokens = TokenBatch(x=torch.randn(batch_size, 6, 5, requires_grad=True), token_mask=torch.tensor([[True, True, True, False, False, False], [True] * 6]))
     calibration_context = {
         "imu": torch.randn(batch_size, 4),
         "lidar": torch.randn(batch_size, 4),
@@ -64,7 +57,7 @@ def test_complete_learned_path_shapes_derived_dimensions_and_gradients() -> None
     assert output.shared_features is not None
     assert output.shared_features.shape == (batch_size, 10)
     for prediction in output.predictions.values():
-        assert prediction.change_logit.shape == (batch_size, 1)
+        assert prediction.change_event_logit.shape == (batch_size, 1)
         assert prediction.change_time.shape == (batch_size, 1)
         assert prediction.delta_xi.shape == (batch_size, 6)
         assert prediction.delta_tau.shape == (batch_size, 1)
@@ -72,7 +65,7 @@ def test_complete_learned_path_shapes_derived_dimensions_and_gradients() -> None
     # Include every deterministic output so gradients cross both heads and the
     # complete Transformer -> flattened summaries -> shared MLP path.
     loss = sum(
-        prediction.change_logit.sum()
+        prediction.change_event_logit.sum()
         + prediction.change_time.sum()
         + prediction.delta_xi.sum()
         + prediction.delta_tau.sum()
@@ -91,7 +84,7 @@ def test_complete_learned_path_shapes_derived_dimensions_and_gradients() -> None
     )
     assert first_mlp_layer.weight.grad is not None
     for head in model.heads.values():
-        assert head.change_logit_head.weight.grad is not None
+        assert head.change_event_logit_head.weight.grad is not None
         assert head.change_time_head.weight.grad is not None
         assert head.delta_xi_head.weight.grad is not None
         assert head.delta_tau_head.weight.grad is not None

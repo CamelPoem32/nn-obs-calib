@@ -14,7 +14,7 @@ def _make_prediction(
     delta_xi: torch.Tensor,
     delta_tau: torch.Tensor,
     *,
-    change_logit: torch.Tensor | None = None,
+    change_event_logit: torch.Tensor | None = None,
     change_time: torch.Tensor | None = None,
 ) -> CalibrationPrediction:
     """Build a complete prediction while focusing tests on state corrections."""
@@ -23,8 +23,8 @@ def _make_prediction(
     dtype = delta_xi.dtype
     device = delta_xi.device
 
-    if change_logit is None:
-        change_logit = torch.zeros(
+    if change_event_logit is None:
+        change_event_logit = torch.zeros(
             batch_size,
             1,
             dtype=dtype,
@@ -40,7 +40,7 @@ def _make_prediction(
         )
 
     return CalibrationPrediction(
-        change_logit=change_logit,
+        change_event_logit=change_event_logit,
         change_time=change_time,
         delta_xi=delta_xi,
         delta_tau=delta_tau,
@@ -244,7 +244,7 @@ def test_change_outputs_do_not_gate_calibration_update() -> None:
     prediction_a = _make_prediction(
         delta_xi,
         delta_tau,
-        change_logit=torch.tensor(
+        change_event_logit=torch.tensor(
             [[-100.0], [100.0]],
             dtype=torch.float64,
         ),
@@ -257,7 +257,7 @@ def test_change_outputs_do_not_gate_calibration_update() -> None:
     prediction_b = _make_prediction(
         delta_xi,
         delta_tau,
-        change_logit=torch.tensor(
+        change_event_logit=torch.tensor(
             [[0.0], [0.0]],
             dtype=torch.float64,
         ),
@@ -270,7 +270,7 @@ def test_change_outputs_do_not_gate_calibration_update() -> None:
     updated_a = updater.update(state, prediction_a)
     updated_b = updater.update(state, prediction_b)
 
-    # change_logit and change_time are auxiliary supervised outputs only.
+    # change_event_logit and change_time are auxiliary supervised outputs only.
     torch.testing.assert_close(
         updated_a.transform,
         updated_b.transform,

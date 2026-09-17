@@ -9,25 +9,38 @@ import torch
 
 @dataclass
 class CalibrationPrediction:
-    """Deterministic output for one calibration head.
+    """
+    Deterministic output for one calibration head.
 
-    # change_logit: Auxiliary supervised change-event score. It does not gate delta_xi or
-    # delta_tau; sigmoid(change_logit) may be thresholded only when a
-    # binary change/no-change metric or diagnostic decision is required.
+    change_event_logit:
+        Auxiliary supervised change-event score. It does not gate the predicted
+        calibration corrections.
 
-    delta_xi uses shape [B, 6]. Before state updates are implemented, the
-    project must fix [rho, phi] versus [phi, rho] ordering, whether rho is
-    direct translation or the translational component of an se(3)
-    perturbation, left versus right perturbation, local/body versus
-    global/world frame interpretation, and Exp(delta_xi) @ T versus
-    T @ Exp(delta_xi).
+    change_time:
+        Predicted calibration-change time relative to the current window start.
 
-    delta_tau is intended as a future additive time-offset correction.
-    Covariance/uncertainty prediction remains a possible later extension and
-    is intentionally absent from this deterministic first-stage output.
+    delta_xi:
+        Spatial calibration correction with shape [B, 6] and ordering
+
+            [phi, rho],
+
+        where phi is the SO(3) rotation vector and rho is the standard SE(3)
+        translational tangent component.
+
+        Corrections use the left-multiplicative convention
+
+            T_next = Exp(delta_xi) @ T_current.
+
+    delta_tau:
+        Additive temporal correction with shape [B, 1]:
+
+            tau_next = tau_current + delta_tau.
+
+    Covariance prediction is intentionally absent from the current deterministic
+    model.
     """
 
-    change_logit: torch.Tensor
+    change_event_logit: torch.Tensor
     change_time: torch.Tensor
     delta_xi: torch.Tensor
     delta_tau: torch.Tensor

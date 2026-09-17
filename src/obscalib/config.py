@@ -79,15 +79,42 @@ class CalibrationHeadConfig:
 
 @dataclass(frozen=True)
 class LossWeights:
-    """Weights applied to precomputed scalar calibration-loss components."""
+    """Relative weights of supervised calibration-loss components."""
 
     lambda_rotation: float = 1.0
     lambda_translation: float = 1.0
     lambda_time_offset: float = 1.0
-    lambda_change: float = 1.0
+    lambda_change_event: float = 1.0
     lambda_change_time: float = 1.0
-    lambda_prior: float = 1.0
-    lambda_consistency: float = 1.0
+    lambda_consistency: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("lambda_rotation", self.lambda_rotation),
+            ("lambda_translation", self.lambda_translation),
+            ("lambda_time_offset", self.lambda_time_offset),
+            ("lambda_change_event", self.lambda_change_event),
+            ("lambda_change_time", self.lambda_change_time),
+            ("lambda_consistency", self.lambda_consistency),
+        ):
+            if value < 0.0:
+                raise ValueError(f"{name} must be nonnegative, got {value}.")
+
+
+@dataclass(frozen=True)
+class CalibrationLossConfig:
+    """Configuration of supervised calibration-loss behavior."""
+
+    weights: LossWeights = field(default_factory=LossWeights)
+    change_time_beta_s: float = 0.1
+    change_positive_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.change_time_beta_s <= 0.0:
+            raise ValueError(f"change_time_beta_s must be positive, got {self.change_time_beta_s}.")
+
+        if self.change_positive_weight <= 0.0:
+            raise ValueError(f"change_positive_weight must be positive, got {self.change_positive_weight}.")
 
 
 @dataclass(frozen=True)

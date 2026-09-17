@@ -8,14 +8,7 @@ from obscalib.models import SummaryTokenTransformerEncoder
 
 
 def make_tokens() -> TokenBatch:
-    return TokenBatch(
-        x=torch.randn(2, 4, 5),
-        token_mask=torch.tensor(
-            [[True, True, False, False], [True, True, True, False]]
-        ),
-        sensor_ids=torch.zeros(2, 4, dtype=torch.long),
-        measurement_types=torch.zeros(2, 4, dtype=torch.long),
-    )
+    return TokenBatch(x=torch.randn(2, 4, 5), token_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
 
 
 @pytest.mark.parametrize("num_summary_tokens", [1, 3])

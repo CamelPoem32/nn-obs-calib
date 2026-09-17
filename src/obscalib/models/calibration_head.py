@@ -39,7 +39,7 @@ class CalibrationHead(nn.Module):
         self.body = nn.Sequential(*layers) if layers else nn.Identity()
 
         # Separate named heads preserve the semantics of each deterministic output.
-        self.change_logit_head = nn.Linear(previous_dim, 1)
+        self.change_event_logit_head = nn.Linear(previous_dim, 1)
         self.change_time_head = nn.Linear(previous_dim, 1)
         self.delta_xi_head = nn.Linear(previous_dim, 6)
         self.delta_tau_head = nn.Linear(previous_dim, 1)
@@ -76,7 +76,7 @@ class CalibrationHead(nn.Module):
         combined = torch.cat((shared_features, calibration_context), dim=-1)
         hidden = self.body(combined)
         return CalibrationPrediction(
-            change_logit=self.change_logit_head(hidden),
+            change_event_logit=self.change_event_logit_head(hidden),
             change_time=self.change_time_head(hidden),
             delta_xi=self.delta_xi_head(hidden),
             delta_tau=self.delta_tau_head(hidden),
