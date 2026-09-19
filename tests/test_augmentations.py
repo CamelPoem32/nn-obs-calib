@@ -21,6 +21,8 @@ from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import GeometryType, MeasurementType, SensorMetadata, SensorStreamBatch, WindowBatch
 from obscalib.geometry.lie import se3_exp, so3_exp
 from obscalib.geometry.processing import GeometryProcessor
+from obscalib.augmentations.config import SamplingRateAugmentationConfig
+from obscalib.augmentations.sampling_rate import SamplingRateAugmenter, _linear_resample, _reduce_relative_se3_scan_rate
 
 
 DTYPE = torch.float64
@@ -1219,3 +1221,218 @@ def test_so3_and_se3_noise_preserve_group_structure() -> None:
         atol=1e-10,
         rtol=1e-10,
     )
+
+def test_sampling_rate_linear_imu_resampling_preserves_linear_signal() -> None:
+    """Linear interpolation must reproduce a linear IMU signal exactly."""
+
+    timestamps = torch.arange(0.0, 1.0 + 1e-12, 0.01, dtype=DTYPE)
+
+    values = torch.stack(
+        (
+            2.0 * timestamps + 1.0,
+            -3.0 * timestamps + 0.5,
+            0.25 * timestamps - 2.0,
+        ),
+        dim=-1,
+    )
+
+    resampled_values, resampled_timestamps = _linear_resample(values, timestamps, target_frequency_hz=37.0)
+
+    expected_values = torch.stack(
+        (
+            2.0 * resampled_timestamps + 1.0,
+            -3.0 * resampled_timestamps + 0.5,
+            0.25 * resampled_timestamps - 2.0,
+        ),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(resampled_values, expected_values, rtol=1e-10, atol=1e-10)
+
+    assert resampled_timestamps[0].item() == pytest.approx(0.0)
+    assert resampled_timestamps[-1].item() == pytest.approx(1.0)
+    assert resampled_timestamps.shape[0] < timestamps.shape[0]
+
+def test_sampling_rate_shared_imu_calibration_key_uses_same_target_frequency() -> None:
+    """Gyroscope and accelerometer streams from one IMU must share the sampled target frequency."""
+
+    timestamps = torch.arange(0.0, 1.0 + 1e-12, 0.01, dtype=DTYPE).reshape(1, -1)
+    sample_mask = torch.ones_like(timestamps, dtype=torch.bool)
+
+    gyro_values = torch.stack(
+        (
+            timestamps,
+            2.0 * timestamps,
+            3.0 * timestamps,
+        ),
+        dim=-1,
+    )
+
+    accel_values = torch.stack(
+        (
+            -timestamps,
+            4.0 * timestamps,
+            0.5 * timestamps,
+        ),
+        dim=-1,
+    )
+
+    window = WindowBatch(
+        streams={
+            "imu_gyro": SensorStreamBatch(values=gyro_values, timestamps=timestamps, sample_mask=sample_mask),
+            "imu_accel": SensorStreamBatch(values=accel_values, timestamps=timestamps, sample_mask=sample_mask),
+        },
+        current_calibration={
+            "imu": _identity_state(),
+        },
+        metadata={
+            "imu_gyro": SensorMetadata(measurement_type=MeasurementType.IMU_GYROSCOPE, geometry_type=GeometryType.VECTOR, calibration_key="imu"),
+            "imu_accel": SensorMetadata(measurement_type=MeasurementType.IMU_ACCELEROMETER, geometry_type=GeometryType.VECTOR, calibration_key="imu"),
+        },
+        targets=None,
+    )
+
+    augmenter = SamplingRateAugmenter(
+        SamplingRateAugmentationConfig(
+            enabled=True,
+            minimum_imu_frequency_hz=40.0,
+            imu_probability=1.0,
+        )
+    )
+
+    generator = torch.Generator().manual_seed(12345)
+
+    augmented_window, target_frequency_hz_by_stream, applied_by_stream = augmenter(window, generator=generator)
+
+    torch.testing.assert_close(target_frequency_hz_by_stream["imu_gyro"], target_frequency_hz_by_stream["imu_accel"])
+
+    assert applied_by_stream["imu_gyro"].item()
+    assert applied_by_stream["imu_accel"].item()
+
+    gyro = augmented_window.streams["imu_gyro"]
+    accel = augmented_window.streams["imu_accel"]
+
+    assert torch.equal(gyro.sample_mask, accel.sample_mask)
+    torch.testing.assert_close(gyro.timestamps, accel.timestamps)
+
+def test_sampling_rate_lidar_10hz_to_7hz_selects_expected_scans() -> None:
+    """A 10 Hz LiDAR sequence reduced to 7 Hz must retain the nearest realizable scan pattern."""
+
+    scan_timestamps = torch.arange(0.0, 1.0 + 1e-12, 0.1, dtype=DTYPE)
+
+    values = torch.eye(4, dtype=DTYPE).reshape(1, 4, 4).repeat(10, 1, 1)
+    values[:, 0, 3] = 1.0
+
+    reduced_values, reduced_end_timestamps, reduced_start_timestamps = _reduce_relative_se3_scan_rate(
+        values,
+        scan_timestamps[:-1],
+        scan_timestamps[1:],
+        target_frequency_hz=7.0,
+    )
+
+    expected_scan_timestamps = torch.tensor(
+        [0.0, 0.1, 0.3, 0.4, 0.6, 0.7, 0.9, 1.0],
+        dtype=DTYPE,
+    )
+
+    torch.testing.assert_close(reduced_start_timestamps, expected_scan_timestamps[:-1], rtol=0.0, atol=1e-12)
+    torch.testing.assert_close(reduced_end_timestamps, expected_scan_timestamps[1:], rtol=0.0, atol=1e-12)
+
+    assert reduced_values.shape == (7, 4, 4)
+
+    expected_x_translations = torch.tensor(
+        [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0],
+        dtype=DTYPE,
+    )
+
+    torch.testing.assert_close(reduced_values[:, 0, 3], expected_x_translations)
+
+def test_sampling_rate_lidar_augmenter_preserves_interval_contract() -> None:
+    """LiDAR scan-rate augmentation must return valid explicit relative intervals."""
+
+    scan_timestamps = torch.arange(0.0, 1.0 + 1e-12, 0.1, dtype=DTYPE)
+
+    values = torch.eye(4, dtype=DTYPE).reshape(1, 1, 4, 4).repeat(1, 10, 1, 1)
+    values[0, :, 0, 3] = 0.1
+
+    window = WindowBatch(
+        streams={
+            "lidar": SensorStreamBatch(
+                values=values,
+                timestamps=scan_timestamps[1:].reshape(1, -1),
+                sample_mask=torch.ones(1, 10, dtype=torch.bool),
+                interval_start_timestamps=scan_timestamps[:-1].reshape(1, -1),
+            )
+        },
+        current_calibration={
+            "lidar": _identity_state(),
+        },
+        metadata={
+            "lidar": SensorMetadata(
+                measurement_type=MeasurementType.LIDAR_POSE,
+                geometry_type=GeometryType.SE3,
+                calibration_key="lidar",
+            )
+        },
+        targets=None,
+    )
+
+    augmenter = SamplingRateAugmenter(
+        SamplingRateAugmentationConfig(
+            enabled=True,
+            minimum_lidar_frequency_hz=5.0,
+            lidar_probability=1.0,
+        )
+    )
+
+    generator = torch.Generator().manual_seed(4321)
+
+    augmented_window, target_frequency_hz_by_stream, applied_by_stream = augmenter(window, generator=generator)
+
+    stream = augmented_window.streams["lidar"]
+    stream.validate()
+
+    valid = stream.sample_mask[0]
+
+    assert applied_by_stream["lidar"].item()
+    assert 5.0 <= target_frequency_hz_by_stream["lidar"].item() <= 10.0
+    assert stream.interval_start_timestamps is not None
+    assert torch.all(stream.interval_start_timestamps[0, valid] < stream.timestamps[0, valid])
+
+    if valid.sum() > 1:
+        torch.testing.assert_close(stream.timestamps[0, valid][:-1], stream.interval_start_timestamps[0, valid][1:], rtol=0.0, atol=1e-9)
+
+def test_sampling_rate_augmentation_disabled_preserves_window() -> None:
+    """Disabled sampling-rate augmentation must leave streams unchanged."""
+
+    timestamps = torch.tensor([[0.0, 0.01, 0.02, 0.03]], dtype=DTYPE)
+    values = torch.randn(1, 4, 3, dtype=DTYPE)
+
+    window = WindowBatch(
+        streams={
+            "imu_gyro": SensorStreamBatch(
+                values=values,
+                timestamps=timestamps,
+                sample_mask=torch.ones_like(timestamps, dtype=torch.bool),
+            )
+        },
+        current_calibration={
+            "imu": _identity_state(),
+        },
+        metadata={
+            "imu_gyro": SensorMetadata(
+                measurement_type=MeasurementType.IMU_GYROSCOPE,
+                geometry_type=GeometryType.VECTOR,
+                calibration_key="imu",
+            )
+        },
+        targets=None,
+    )
+
+    augmenter = SamplingRateAugmenter(SamplingRateAugmentationConfig())
+
+    augmented_window, target_frequency_hz_by_stream, applied_by_stream = augmenter(window)
+
+    assert augmented_window is window
+    assert target_frequency_hz_by_stream == {}
+    assert applied_by_stream == {}

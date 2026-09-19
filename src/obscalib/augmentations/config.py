@@ -316,21 +316,53 @@ class NoiseAugmentationConfig:
 
         return False
 
+@dataclass(frozen=True)
+class SamplingRateAugmentationConfig:
+    """
+    Sampling-rate augmentation for IMU and relative LiDAR measurements.
+
+    IMU streams are linearly resampled onto a regular grid whose frequency is sampled uniformly between minimum_imu_frequency_hz and the current source frequency.
+
+    Gyroscope and accelerometer streams sharing one calibration key receive the same sampled target frequency.
+
+    Relative LiDAR SE3 measurements are reduced by retaining a lower-rate subset of scan timestamps and composing all relative transforms spanning each retained interval.
+    """
+
+    enabled: bool = False
+
+    minimum_imu_frequency_hz: float | None = None
+    minimum_lidar_frequency_hz: float | None = None
+
+    imu_probability: float = 1.0
+    lidar_probability: float = 1.0
+
+    def __post_init__(self) -> None:
+        _validate_probability("imu_probability", self.imu_probability)
+        _validate_probability("lidar_probability", self.lidar_probability)
+
+        for name, frequency_hz in (("minimum_imu_frequency_hz", self.minimum_imu_frequency_hz), ("minimum_lidar_frequency_hz", self.minimum_lidar_frequency_hz)):
+            if frequency_hz is not None and (not math.isfinite(frequency_hz) or frequency_hz <= 0.0):
+                raise ValueError(f"{name} must be finite and positive when configured.")
+
+        if not self.enabled:
+            return
+
+        if self.minimum_imu_frequency_hz is None and self.minimum_lidar_frequency_hz is None:
+            raise ValueError("Enabled sampling-rate augmentation requires at least one minimum frequency.")
+
+        has_possible_augmentation = (self.minimum_imu_frequency_hz is not None and self.imu_probability > 0.0) or (self.minimum_lidar_frequency_hz is not None and self.lidar_probability > 0.0)
+
+        if not has_possible_augmentation:
+            raise ValueError("Enabled sampling-rate augmentation requires at least one configured modality with nonzero probability.")
 
 @dataclass(frozen=True)
 class AugmentationConfig:
     """Top-level composition of independently configurable augmentation stages."""
 
-    # Coordinate-frame randomization configuration.
+    sampling_rate: SamplingRateAugmentationConfig = field(default_factory=SamplingRateAugmentationConfig)
     frame_randomization: FrameRandomizationConfig = field(default_factory=FrameRandomizationConfig)
-
-    # Imperfect model-input calibration-prior configuration.
     prior_perturbation: PriorPerturbationConfig = field(default_factory=PriorPerturbationConfig)
-
-    # True within-window calibration-change event configuration.
     calibration_event: CalibrationEventConfig = field(default_factory=CalibrationEventConfig)
-
-    # Measurement-noise augmentation configuration.
     noise: NoiseAugmentationConfig = field(default_factory=NoiseAugmentationConfig)
 
 

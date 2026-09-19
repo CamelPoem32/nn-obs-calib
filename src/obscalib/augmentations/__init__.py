@@ -9,6 +9,7 @@ from obscalib.augmentations.config import (
     PerturbationDistribution,
     PerturbationMagnitudeConfig,
     PriorPerturbationConfig,
+    SamplingRateAugmentationConfig,
 )
 from obscalib.augmentations.frame_randomization import SensorFrameRandomizer
 from obscalib.augmentations.noise import MeasurementNoiseAugmenter
@@ -21,6 +22,7 @@ from obscalib.augmentations.structures import (
     CalibrationEvent,
     CalibrationTrajectory,
 )
+from obscalib.augmentations.sampling_rate import SamplingRateAugmenter
 
 __all__ = [
     "AugmentationConfig",
@@ -40,4 +42,6 @@ __all__ = [
     "PriorPerturbationConfig",
     "SensorFrameRandomizer",
     "TransitionProfile",
+    "SamplingRateAugmentationConfig",
+    "SamplingRateAugmenter",
 ]
