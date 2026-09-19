@@ -37,7 +37,7 @@ def _require_same_keys(
 
 
 def _collate_sensor_streams(streams: Sequence[SensorStream]) -> SensorStreamBatch:
-    """Pad one raw sensor independently while preserving its native measurement shape."""
+    """Pad one sensor independently to the longest stream in this minibatch."""
 
     if not streams:
         raise ValueError("Cannot collate an empty sensor-stream sequence.")
@@ -46,15 +46,16 @@ def _collate_sensor_streams(streams: Sequence[SensorStream]) -> SensorStreamBatc
         stream.validate()
 
     sample_shape = streams[0].values.shape[1:]
-    dtype = streams[0].values.dtype
-    device = streams[0].values.device
+    values_dtype = streams[0].values.dtype
     timestamp_dtype = streams[0].timestamps.dtype
+    device = streams[0].values.device
+    has_interval_starts = streams[0].interval_start_timestamps is not None
 
     for stream in streams[1:]:
         if stream.values.shape[1:] != sample_shape:
             raise ValueError("The same sensor stream must have one measurement shape throughout a minibatch.")
 
-        if stream.values.dtype != dtype:
+        if stream.values.dtype != values_dtype:
             raise ValueError("The same sensor stream must have one values dtype throughout a minibatch.")
 
         if stream.timestamps.dtype != timestamp_dtype:
@@ -63,20 +64,29 @@ def _collate_sensor_streams(streams: Sequence[SensorStream]) -> SensorStreamBatc
         if stream.values.device != device or stream.timestamps.device != device:
             raise ValueError("The same sensor stream must be on one device throughout a minibatch.")
 
+        if (stream.interval_start_timestamps is not None) != has_interval_starts:
+            raise ValueError("interval_start_timestamps must be present for either all or none of the samples of one sensor stream in a minibatch.")
+
     batch_size = len(streams)
     max_samples = max(stream.values.shape[0] for stream in streams)
 
-    values = torch.zeros((batch_size, max_samples, *sample_shape), dtype=dtype, device=device)
+    # Preserve the complete per-measurement representation, including matrix-valued SO3/SE3 measurements.
+    values = torch.zeros((batch_size, max_samples, *sample_shape), dtype=values_dtype, device=device)
     timestamps = torch.zeros((batch_size, max_samples), dtype=timestamp_dtype, device=device)
     sample_mask = torch.zeros((batch_size, max_samples), dtype=torch.bool, device=device)
+    interval_start_timestamps = torch.zeros((batch_size, max_samples), dtype=timestamp_dtype, device=device) if has_interval_starts else None
 
     for batch_index, stream in enumerate(streams):
         num_samples = stream.values.shape[0]
+
         values[batch_index, :num_samples] = stream.values
         timestamps[batch_index, :num_samples] = stream.timestamps
         sample_mask[batch_index, :num_samples] = True
 
-    return SensorStreamBatch(values=values, timestamps=timestamps, sample_mask=sample_mask)
+        if interval_start_timestamps is not None:
+            interval_start_timestamps[batch_index, :num_samples] = stream.interval_start_timestamps
+
+    return SensorStreamBatch(values=values, timestamps=timestamps, sample_mask=sample_mask, interval_start_timestamps=interval_start_timestamps)
 
 
 def _collate_calibration_states(

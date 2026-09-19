@@ -35,7 +35,7 @@ class GeometryType(str, Enum):
     SE3 = "se3"
 
 
-def _validate_unbatched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor) -> None:
+def _validate_unbatched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor, interval_start_timestamps: torch.Tensor | None = None) -> None:
     """Validate an unbatched variable-length sensor sequence."""
 
     if values.ndim < 2:
@@ -56,8 +56,24 @@ def _validate_unbatched_sequence_fields(values: torch.Tensor, timestamps: torch.
     if values.device != timestamps.device:
         raise ValueError("values and timestamps must be on the same device.")
 
+    if interval_start_timestamps is not None:
+        if interval_start_timestamps.ndim != 1 or interval_start_timestamps.shape != timestamps.shape:
+            raise ValueError("interval_start_timestamps must have shape [N].")
 
-def _validate_batched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor, sample_mask: torch.Tensor) -> None:
+        if not torch.is_floating_point(interval_start_timestamps):
+            raise TypeError("interval_start_timestamps must have floating-point dtype.")
+
+        if interval_start_timestamps.device != timestamps.device:
+            raise ValueError("interval_start_timestamps and timestamps must be on the same device.")
+
+        if interval_start_timestamps.dtype != timestamps.dtype:
+            raise TypeError("interval_start_timestamps and timestamps must have the same dtype.")
+
+        if torch.any(interval_start_timestamps >= timestamps):
+            raise ValueError("Every interval start timestamp must be strictly smaller than its corresponding end timestamp.")
+
+
+def _validate_batched_sequence_fields(values: torch.Tensor, timestamps: torch.Tensor, sample_mask: torch.Tensor, interval_start_timestamps: torch.Tensor | None = None) -> None:
     """Validate a padded batch of variable-length sensor sequences."""
 
     if values.ndim < 3:
@@ -87,6 +103,22 @@ def _validate_batched_sequence_fields(values: torch.Tensor, timestamps: torch.Te
     if not (values.device == timestamps.device == sample_mask.device):
         raise ValueError("values, timestamps, and sample_mask must be on the same device.")
 
+    if interval_start_timestamps is not None:
+        if interval_start_timestamps.shape != timestamps.shape:
+            raise ValueError("interval_start_timestamps must have shape [B, N].")
+
+        if not torch.is_floating_point(interval_start_timestamps):
+            raise TypeError("interval_start_timestamps must have floating-point dtype.")
+
+        if interval_start_timestamps.device != timestamps.device:
+            raise ValueError("interval_start_timestamps and timestamps must be on the same device.")
+
+        if interval_start_timestamps.dtype != timestamps.dtype:
+            raise TypeError("interval_start_timestamps and timestamps must have the same dtype.")
+
+        if torch.any(interval_start_timestamps[sample_mask] >= timestamps[sample_mask]):
+            raise ValueError("Every valid interval start timestamp must be strictly smaller than its corresponding end timestamp.")
+
 
 @dataclass
 class SensorStream:
@@ -94,21 +126,23 @@ class SensorStream:
     One unbatched variable-length sensor stream.
 
     values:
-        Sensor measurements with shape [N_s, d_s].
+        Measurements with shape [N, ...].
 
     timestamps:
-        Measurement timestamps with shape [N_s]. Full input streams use their
-        common source time reference. Streams returned by build_windows() use
-        seconds relative to the beginning of their window.
+        Measurement timestamps with shape [N]. For point measurements these are measurement times. For relative SO3/SE3 measurements these are interval end times.
+
+    interval_start_timestamps:
+        Optional interval start times with shape [N]. This is None for point measurements and populated for relative SO3/SE3 measurements.
     """
 
     values: torch.Tensor
     timestamps: torch.Tensor
+    interval_start_timestamps: torch.Tensor | None = None
 
     def validate(self) -> None:
         """Validate the unbatched stream contract."""
 
-        _validate_unbatched_sequence_fields(self.values, self.timestamps)
+        _validate_unbatched_sequence_fields(self.values, self.timestamps, self.interval_start_timestamps)
 
 @dataclass
 class StreamWindow:
@@ -126,35 +160,33 @@ class StreamWindow:
     window_end_time: float
     streams: dict[str, SensorStream]
 
-
 @dataclass
 class SensorStreamBatch:
     """
     One padded raw sensor stream for a minibatch.
 
     values:
-        [B, N_s_max, d_s]
+        [B, N_max, ...]
 
     timestamps:
-        [B, N_s_max]
+        [B, N_max]. Point-measurement times or relative-measurement interval end times.
 
     sample_mask:
-        [B, N_s_max], where True denotes a real sensor sample and False
-        denotes padding introduced during minibatch collation.
+        [B, N_max], where True denotes a real sample.
+
+    interval_start_timestamps:
+        Optional [B, N_max] interval start times for relative SO3/SE3 measurements.
     """
 
     values: torch.Tensor
     timestamps: torch.Tensor
     sample_mask: torch.Tensor
+    interval_start_timestamps: torch.Tensor | None = None
 
     def validate(self) -> None:
         """Validate the padded sensor-stream contract."""
 
-        _validate_batched_sequence_fields(
-            self.values,
-            self.timestamps,
-            self.sample_mask,
-        )
+        _validate_batched_sequence_fields(self.values, self.timestamps, self.sample_mask, self.interval_start_timestamps)
 
 
 
