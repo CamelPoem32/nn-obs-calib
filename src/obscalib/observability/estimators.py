@@ -211,6 +211,7 @@ class ObservabilityMatrixEstimator(ObservabilityEstimator):
         numerics: ObservabilityNumericsConfig | None = None,
         gravity_world: torch.Tensor | None = None,
         gyro_bias_by_calibration_key: Mapping[str, torch.Tensor] | None = None,
+        njit: bool = False,
     ) -> None:
         super().__init__()
 
@@ -226,6 +227,7 @@ class ObservabilityMatrixEstimator(ObservabilityEstimator):
         self.numerics = numerics if numerics is not None else ObservabilityNumericsConfig()
         self.gravity_world = gravity_world
         self.gyro_bias_by_calibration_key = None if gyro_bias_by_calibration_key is None else dict(gyro_bias_by_calibration_key)
+        self.njit = bool(njit)
 
     def _estimate_single_window(
         self,
@@ -268,6 +270,7 @@ class ObservabilityMatrixEstimator(ObservabilityEstimator):
             residual_covariance_by_stream=residual_covariance_by_stream,
             gravity_world=gravity_world,
             lidar_interval_start_timestamps_by_stream=lidar_interval_start_timestamps_by_stream,
+            njit=self.njit,
         )
 
         return compute_observability_matrix_single_window(linearization, self.numerics)

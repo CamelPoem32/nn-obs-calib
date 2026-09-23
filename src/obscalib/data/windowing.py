@@ -1,4 +1,4 @@
-"""Temporal window construction for synchronized sensor streams."""
+"""Temporal window construction for synchronized point and interval sensor streams."""
 
 from __future__ import annotations
 
@@ -11,8 +11,17 @@ from obscalib.config import WindowingConfig
 from obscalib.data.structures import GeometryType, SensorMetadata, SensorStream, StreamWindow
 
 
+_INTERVAL_CHAIN_ATOL_SECONDS = 1e-6
+
+
 def _validate_raw_streams(streams: Mapping[str, SensorStream], metadata: Mapping[str, SensorMetadata] | None = None) -> None:
-    """Validate input streams, timestamps, and point-versus-interval semantics."""
+    """
+    Validate source streams and their point-versus-interval semantics.
+
+    Interval semantics are carried explicitly by ``interval_start_timestamps``.
+    They are not inferred from SO(3) or SE(3) geometry alone because an SE(3)
+    stream may also represent point poses rather than relative motion.
+    """
 
     if not streams:
         raise ValueError("At least one sensor stream is required.")
@@ -29,30 +38,38 @@ def _validate_raw_streams(streams: Mapping[str, SensorStream], metadata: Mapping
         if not torch.isfinite(stream.timestamps).all():
             raise ValueError(f"Timestamps for sensor stream {stream_name!r} must be finite.")
 
-        if not torch.all(stream.timestamps[1:] >= stream.timestamps[:-1]):
-            raise ValueError(f"Timestamps for sensor stream {stream_name!r} must be sorted in nondecreasing order.")
+        if stream.timestamps.numel() > 1 and torch.any(stream.timestamps[1:] <= stream.timestamps[:-1]):
+            raise ValueError(f"Timestamps for sensor stream {stream_name!r} must be strictly increasing.")
 
         if stream.interval_start_timestamps is not None:
             if not torch.isfinite(stream.interval_start_timestamps).all():
                 raise ValueError(f"Interval start timestamps for sensor stream {stream_name!r} must be finite.")
 
-            if not torch.all(stream.interval_start_timestamps[1:] >= stream.interval_start_timestamps[:-1]):
-                raise ValueError(f"Interval start timestamps for sensor stream {stream_name!r} must be sorted in nondecreasing order.")
+            if stream.interval_start_timestamps.numel() > 1 and torch.any(stream.interval_start_timestamps[1:] <= stream.interval_start_timestamps[:-1]):
+                raise ValueError(f"Interval start timestamps for sensor stream {stream_name!r} must be strictly increasing.")
 
         if metadata is None:
             continue
 
-        geometry_type = metadata[stream_name].geometry_type
+        stream_metadata = metadata[stream_name]
 
-        if geometry_type == GeometryType.VECTOR and stream.interval_start_timestamps is not None:
-            raise ValueError(f"VECTOR stream {stream_name!r} must not define interval_start_timestamps.")
+        if stream.interval_start_timestamps is not None and stream_metadata.geometry_type not in {GeometryType.SO3, GeometryType.SE3}:
+            raise ValueError(f"Interval-valued stream {stream_name!r} must use SO3 or SE3 geometry.")
 
-        if geometry_type in {GeometryType.SO3, GeometryType.SE3} and stream.interval_start_timestamps is None:
-            raise ValueError(f"{geometry_type.value.upper()} stream {stream_name!r} must define interval_start_timestamps.")
+        if stream_metadata.requires_interval_timestamps and stream.interval_start_timestamps is None:
+            raise ValueError(f"Measurement stream {stream_name!r} requires interval_start_timestamps.")
+
+        if stream_metadata.requires_interval_timestamps and stream_metadata.geometry_type != GeometryType.SE3:
+            raise ValueError(f"Current LIDAR_POSE stream {stream_name!r} must use SE3 geometry.")
 
 
 def _common_stream_interval(streams: Mapping[str, SensorStream]) -> tuple[float, float] | None:
-    """Return the temporal interval jointly covered by all non-empty streams."""
+    """
+    Return the temporal interval jointly covered by all non-empty streams.
+
+    Point streams begin at their first sample timestamp. Interval streams begin
+    at the start of their first complete measurement interval.
+    """
 
     if any(stream.timestamps.numel() == 0 for stream in streams.values()):
         return None
@@ -68,10 +85,10 @@ def _common_stream_interval(streams: Mapping[str, SensorStream]) -> tuple[float,
 
 def _window_indices(timestamps: torch.Tensor, window_start_time: float, window_end_time: float) -> tuple[int, int]:
     """
-    Find the half-open timestamp interval [window_start_time, window_end_time).
+    Find indices for the half-open interval ``[window_start_time, window_end_time)``.
 
-    Half-open windows prevent measurements exactly on a boundary from appearing
-    in two adjacent non-overlapping windows.
+    Half-open point-measurement windows prevent a sample exactly on a boundary
+    from appearing in two adjacent non-overlapping windows.
     """
 
     start_tensor = timestamps.new_tensor(window_start_time)
@@ -83,8 +100,29 @@ def _window_indices(timestamps: torch.Tensor, window_start_time: float, window_e
     return start_index, end_index
 
 
+def _validate_max_samples(max_samples: int) -> None:
+    """
+    Validate the per-stream storage/token cap.
+
+    This cap belongs to generic dataset windowing. It is distinct from the
+    observability reference trajectory grid, which is selected later.
+    """
+
+    if max_samples <= 0:
+        raise ValueError("max_samples must be strictly positive.")
+
+
 def _downsample_point_stream(stream: SensorStream, max_samples: int) -> SensorStream:
-    """Downsample point measurements using the existing integer-factor decimation rule."""
+    """
+    Cap a point-measurement stream using the existing integer-factor decimation rule.
+
+    This operation is a generic window-size cap and is not the observability
+    reference-grid reduction. Gyroscope integration and accelerometer selection
+    relative to trajectory support timestamps happen later in observability
+    linearization.
+    """
+
+    _validate_max_samples(max_samples)
 
     num_samples = stream.values.shape[0]
     downsampling_factor = max(1, math.ceil(num_samples / max_samples))
@@ -96,7 +134,14 @@ def _downsample_point_stream(stream: SensorStream, max_samples: int) -> SensorSt
 
 
 def _downsample_relative_stream(stream: SensorStream, max_samples: int, geometry_type: GeometryType) -> SensorStream:
-    """Reduce relative SO3/SE3 measurements by composing consecutive intervals rather than discarding motion."""
+    """
+    Reduce consecutive relative SO(3)/SE(3) measurements by composition.
+
+    Composition preserves the net relative motion across every retained interval,
+    unlike ordinary decimation, which would discard intermediate motion.
+    """
+
+    _validate_max_samples(max_samples)
 
     if stream.interval_start_timestamps is None:
         raise ValueError("Relative measurement downsampling requires interval_start_timestamps.")
@@ -109,8 +154,7 @@ def _downsample_relative_stream(stream: SensorStream, max_samples: int, geometry
     if num_samples <= max_samples:
         return stream
 
-    # Composition assumes a chain of consecutive relative intervals.
-    if num_samples > 1 and not torch.allclose(stream.timestamps[:-1], stream.interval_start_timestamps[1:], rtol=0.0, atol=1e-6):
+    if num_samples > 1 and not torch.allclose(stream.timestamps[:-1], stream.interval_start_timestamps[1:], rtol=0.0, atol=_INTERVAL_CHAIN_ATOL_SECONDS):
         raise ValueError("Relative SO3/SE3 measurements must form consecutive intervals before composition-based downsampling.")
 
     chunk_size = math.ceil(num_samples / max_samples)
@@ -122,7 +166,6 @@ def _downsample_relative_stream(stream: SensorStream, max_samples: int, geometry
     for start_index in range(0, num_samples, chunk_size):
         end_index = min(start_index + chunk_size, num_samples)
         chunk_values = stream.values[start_index:end_index]
-
         composed_value = chunk_values[0]
 
         for value in chunk_values[1:]:
@@ -136,7 +179,15 @@ def _downsample_relative_stream(stream: SensorStream, max_samples: int, geometry
 
 
 def _downsample_stream(stream: SensorStream, max_samples: int, geometry_type: GeometryType | None) -> SensorStream:
-    """Downsample point measurements by decimation and relative group measurements by composition."""
+    """
+    Apply the generic per-stream sample cap without changing interval semantics.
+
+    Point streams use integer-factor decimation. Interval-valued SO(3)/SE(3)
+    streams use composition so their retained measurements still represent the
+    complete motion over each retained interval.
+    """
+
+    _validate_max_samples(max_samples)
 
     if stream.values.shape[0] <= max_samples:
         return stream
@@ -152,9 +203,11 @@ def _downsample_stream(stream: SensorStream, max_samples: int, geometry_type: Ge
 
 def _extract_stream_window(stream: SensorStream, window_start_time: float, window_end_time: float, max_samples: int, geometry_type: GeometryType | None = None) -> SensorStream | None:
     """
-    Extract, geometry-aware downsample, and time-normalize one sensor stream.
+    Extract, cap, and time-normalize one sensor stream.
 
-    Point measurements use the half-open interval [window_start_time, window_end_time). Relative SO3/SE3 measurements are accepted only when their complete [start, end] interval lies inside the window.
+    Point measurements use the half-open interval ``[window_start_time,
+    window_end_time)``. Interval measurements are retained only when both their
+    start and end timestamps lie inside the window.
     """
 
     if stream.interval_start_timestamps is None:
@@ -168,7 +221,7 @@ def _extract_stream_window(stream: SensorStream, window_start_time: float, windo
 
         return SensorStream(values=window_stream.values, timestamps=window_stream.timestamps - window_start_time, interval_start_timestamps=None)
 
-    # Relative group measurements must have both endpoints inside the window. An interval ending exactly at the window boundary belongs to this window because it cannot belong to the following one: its start lies before that boundary.
+    # An interval ending exactly at the window boundary remains in this window because its start lies before that boundary and it cannot be represented completely in the following window.
     interval_mask = (stream.interval_start_timestamps >= window_start_time) & (stream.timestamps <= window_end_time)
     indices = torch.nonzero(interval_mask, as_tuple=False).squeeze(-1)
 
@@ -183,16 +236,20 @@ def _extract_stream_window(stream: SensorStream, window_start_time: float, windo
 
 def build_windows(streams: Mapping[str, SensorStream], config: WindowingConfig | None = None, start_time: float | None = None, end_time: float | None = None, metadata: Mapping[str, SensorMetadata] | None = None) -> list[StreamWindow]:
     """
-    Split synchronized raw sensor streams into fixed-duration temporal windows.
+    Split synchronized sensor streams into fixed-duration windows.
 
-    Point measurements are sliced by their measurement timestamps. Relative SO3/SE3 measurements carry explicit interval start/end timestamps and are included only when their complete interval lies inside the window.
+    Source measurements retain their point-versus-interval semantics. Relative
+    SO(3)/SE(3) measurements preserve explicit start and end timestamps and are
+    composed, rather than discarded, when the generic sample cap is exceeded.
 
-    Relative SO3/SE3 measurements are reduced by composition when the configured maximum number of samples is exceeded.
+    This function does not select the observability reference trajectory grid.
+    That grid is chosen later from each completed window.
     """
 
     if config is None:
         config = WindowingConfig()
 
+    _validate_max_samples(config.max_samples_per_sensor)
     _validate_raw_streams(streams, metadata)
 
     common_interval = _common_stream_interval(streams)
