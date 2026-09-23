@@ -698,10 +698,274 @@ def se3_log(transform: torch.Tensor) -> torch.Tensor:
 
     return torch.cat((phi, rho), dim=-1)
 
+def se3_inverse(transform: torch.Tensor) -> torch.Tensor:
+    '''Compute the analytic inverse of one or more SE(3) transforms.
+
+    Parameters
+    ----------
+    transform:
+        Homogeneous transforms with shape [..., 4, 4].
+
+    Returns
+    -------
+    torch.Tensor
+        Inverse transforms with shape [..., 4, 4].
+    '''
+
+    _validate_matrix(transform, 4, 4, "transform")
+
+    rotation = transform[..., :3, :3]
+    translation = transform[..., :3, 3]
+
+    rotation_inverse = rotation.transpose(-1, -2)
+    translation_inverse = -(
+        rotation_inverse @ translation.unsqueeze(-1)
+    ).squeeze(-1)
+
+    inverse = torch.zeros_like(transform)
+    inverse[..., :3, :3] = rotation_inverse
+    inverse[..., :3, 3] = translation_inverse
+    inverse[..., 3, 3] = 1.0
+
+    return inverse
+
+
+def se3_adjoint(transform: torch.Tensor) -> torch.Tensor:
+    '''Compute the SE(3) group adjoint for rotation-first tangents.
+
+    For
+
+        T = [R, t]
+
+    and tangent ordering xi = [phi, rho],
+
+        Ad_T = [       R   0 ]
+               [hat(t)R   R ].
+
+    Parameters
+    ----------
+    transform:
+        Homogeneous transforms with shape [..., 4, 4].
+
+    Returns
+    -------
+    torch.Tensor
+        Group adjoints with shape [..., 6, 6].
+    '''
+
+    _validate_matrix(transform, 4, 4, "transform")
+
+    rotation = transform[..., :3, :3]
+    translation = transform[..., :3, 3]
+
+    adjoint = torch.zeros(
+        transform.shape[:-2] + (6, 6),
+        dtype=transform.dtype,
+        device=transform.device,
+    )
+
+    adjoint[..., :3, :3] = rotation
+    adjoint[..., 3:, :3] = so3_hat(translation) @ rotation
+    adjoint[..., 3:, 3:] = rotation
+
+    return adjoint
+
+
+def interpolate_se3(
+    transform_start: torch.Tensor,
+    transform_end: torch.Tensor,
+    alpha: torch.Tensor | float,
+    *,
+    allow_extrapolation: bool = False,
+) -> torch.Tensor:
+    '''Interpolate SE(3) transforms along the local relative geodesic.
+
+    The interpolation follows
+
+        T(alpha) = T_start @ Exp(
+            alpha * Log(inv(T_start) @ T_end)
+        ).
+
+    ``alpha`` may be a scalar or broadcast to the leading dimensions of the
+    endpoint transforms.
+
+    Parameters
+    ----------
+    transform_start:
+        Starting transforms with shape [..., 4, 4].
+    transform_end:
+        Ending transforms with the same shape.
+    alpha:
+        Interpolation fractions. Values are restricted to [0, 1] unless
+        ``allow_extrapolation`` is true.
+    allow_extrapolation:
+        Whether interpolation fractions outside [0, 1] are allowed.
+
+    Returns
+    -------
+    torch.Tensor
+        Interpolated transforms with shape [..., 4, 4].
+    '''
+
+    _validate_matrix(
+        transform_start,
+        4,
+        4,
+        "transform_start",
+    )
+    _validate_matrix(
+        transform_end,
+        4,
+        4,
+        "transform_end",
+    )
+
+    if transform_start.shape != transform_end.shape:
+        raise ValueError(
+            "transform_start and transform_end must have identical shapes."
+        )
+
+    if transform_start.device != transform_end.device:
+        raise ValueError(
+            "transform_start and transform_end must be on the same device."
+        )
+
+    if transform_start.dtype != transform_end.dtype:
+        raise ValueError(
+            "transform_start and transform_end must have the same dtype."
+        )
+
+    alpha_tensor = torch.as_tensor(
+        alpha,
+        dtype=transform_start.dtype,
+        device=transform_start.device,
+    )
+
+    try:
+        alpha_tensor = torch.broadcast_to(
+            alpha_tensor,
+            transform_start.shape[:-2],
+        )
+    except RuntimeError as exc:
+        raise ValueError(
+            "alpha must be scalar or broadcast to the transform batch shape."
+        ) from exc
+
+    if not torch.isfinite(alpha_tensor).all():
+        raise ValueError(
+            "alpha must contain only finite values."
+        )
+
+    if not allow_extrapolation and torch.any(
+        (alpha_tensor < 0.0)
+        | (alpha_tensor > 1.0)
+    ):
+        raise ValueError(
+            "alpha must lie in [0, 1] unless extrapolation is enabled."
+        )
+
+    relative_transform = (
+        se3_inverse(transform_start)
+        @ transform_end
+    )
+    relative_tangent = se3_log(
+        relative_transform
+    )
+
+    return (
+        transform_start
+        @ se3_exp(
+            alpha_tensor[..., None]
+            * relative_tangent
+        )
+    )
+
+def se3_little_adjoint(xi: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the SE(3) Lie-algebra adjoint for rotation-first tangents.
+
+    The input has shape [..., 6] with xi = [phi, rho]. The returned matrix has
+    shape [..., 6, 6] and follows the same convention as se3_adjoint().
+    """
+
+    if not isinstance(xi, torch.Tensor):
+        raise TypeError("xi must be a torch.Tensor.")
+    if xi.ndim < 1 or xi.shape[-1] != 6:
+        raise ValueError("xi must have shape [..., 6].")
+    if not torch.is_floating_point(xi):
+        raise TypeError("xi must use a floating-point dtype.")
+    if not torch.isfinite(xi).all():
+        raise ValueError("xi must contain only finite values.")
+
+    phi_hat = so3_hat(xi[..., :3])
+    rho_hat = so3_hat(xi[..., 3:])
+
+    ad = torch.zeros(xi.shape[:-1] + (6, 6), dtype=xi.dtype, device=xi.device)
+    ad[..., :3, :3] = phi_hat
+    ad[..., 3:, :3] = rho_hat
+    ad[..., 3:, 3:] = phi_hat
+
+    return ad
+
+
+def se3_left_jacobian(xi: torch.Tensor, *, tolerance: float = 1e-14, max_terms: int = 80) -> torch.Tensor:
+    """
+    Compute the SE(3) left Jacobian from the algebra-adjoint power series.
+
+    This mirrors the validated NumPy implementation used by the previous
+    observability package while supporting arbitrary leading batch dimensions.
+    """
+
+    if tolerance <= 0.0:
+        raise ValueError("tolerance must be positive.")
+    if max_terms < 2:
+        raise ValueError("max_terms must be at least two.")
+
+    ad = se3_little_adjoint(xi)
+    identity = torch.eye(6, dtype=xi.dtype, device=xi.device).expand(xi.shape[:-1] + (6, 6))
+    jacobian = identity.clone()
+    power = identity.clone()
+    factorial = 1.0
+    converged = False
+
+    for n in range(1, max_terms):
+        power = power @ ad
+        factorial *= float(n + 1)
+        term = power / factorial
+        jacobian = jacobian + term
+
+        term_norm = torch.linalg.matrix_norm(term, ord="fro", dim=(-2, -1))
+        if bool(torch.all(term_norm < tolerance)):
+            converged = True
+            break
+
+    if not converged:
+        tangent_norm = torch.linalg.vector_norm(xi, dim=-1)
+        if not bool(torch.all(tangent_norm < 1e-10)):
+            raise ValueError("SE(3) left-Jacobian series did not converge.")
+
+    return jacobian
+
+
+def se3_left_jacobian_inverse(xi: torch.Tensor, *, tolerance: float = 1e-14, max_terms: int = 80) -> torch.Tensor:
+    """
+    Compute the inverse SE(3) left Jacobian with a linear solve.
+
+    Solving J X = I avoids forming an explicit matrix inverse and preserves
+    arbitrary leading batch dimensions.
+    """
+
+    jacobian = se3_left_jacobian(xi, tolerance=tolerance, max_terms=max_terms)
+    identity = torch.eye(6, dtype=xi.dtype, device=xi.device).expand(jacobian.shape[:-2] + (6, 6))
+
+    return torch.linalg.solve(jacobian, identity)
 
 __all__ = [
+    "interpolate_se3",
+    "se3_adjoint",
     "se3_exp",
     "se3_hat",
+    "se3_inverse",
     "se3_log",
     "se3_vee",
     "so3_exp",
@@ -710,4 +974,7 @@ __all__ = [
     "so3_left_jacobian_inverse",
     "so3_log",
     "so3_vee",
+    "se3_left_jacobian",
+    "se3_left_jacobian_inverse",
+    "se3_little_adjoint",
 ]

@@ -140,9 +140,27 @@ class SensorStream:
     interval_start_timestamps: torch.Tensor | None = None
 
     def validate(self) -> None:
-        """Validate the unbatched stream contract."""
+        """
+        Validate the unbatched stream contract.
+
+        Interval-valued streams keep their start timestamps explicitly instead of
+        encoding interval semantics implicitly in the measurement geometry.
+        """
 
         _validate_unbatched_sequence_fields(self.values, self.timestamps, self.interval_start_timestamps)
+
+    @property
+    def is_interval_valued(self) -> bool:
+        """
+        Return whether each measurement represents a finite time interval.
+
+        Point measurements such as IMU samples have only ``timestamps``.
+        Relative-pose measurements such as the current LiDAR odometry stream also
+        carry ``interval_start_timestamps``.
+        """
+
+        return self.interval_start_timestamps is not None
+
 
 @dataclass
 class StreamWindow:
@@ -159,6 +177,7 @@ class StreamWindow:
     window_start_time: float
     window_end_time: float
     streams: dict[str, SensorStream]
+
 
 @dataclass
 class SensorStreamBatch:
@@ -184,11 +203,25 @@ class SensorStreamBatch:
     interval_start_timestamps: torch.Tensor | None = None
 
     def validate(self) -> None:
-        """Validate the padded sensor-stream contract."""
+        """
+        Validate the padded sensor-stream contract.
+
+        Padding is ignored when checking interval ordering, so only real samples
+        are required to have start timestamps strictly before their end timestamps.
+        """
 
         _validate_batched_sequence_fields(self.values, self.timestamps, self.sample_mask, self.interval_start_timestamps)
 
+    @property
+    def is_interval_valued(self) -> bool:
+        """
+        Return whether the batch carries interval start timestamps.
 
+        Every sample in one physical stream uses the same point-versus-interval
+        representation.
+        """
+
+        return self.interval_start_timestamps is not None
 
 
 @dataclass(frozen=True)
@@ -215,6 +248,19 @@ class SensorMetadata:
     measurement_type: MeasurementType
     geometry_type: GeometryType
     calibration_key: str
+
+    @property
+    def requires_interval_timestamps(self) -> bool:
+        """
+        Return whether the currently supported measurement type is interval-valued.
+
+        The present pipeline defines ``LIDAR_POSE`` as a relative LiDAR pose over
+        a scan-to-scan or scan-to-map update interval. Other SE(3) modalities may
+        later represent point poses, so interval semantics must not be inferred
+        from ``geometry_type`` alone.
+        """
+
+        return self.measurement_type == MeasurementType.LIDAR_POSE
 
 
 @dataclass
@@ -388,6 +434,7 @@ class CanonicalSensorStreamBatch:
         )
         if self.values.ndim != 3:
             raise ValueError("Canonical values must have shape [B, N, D].")
+
 
 @dataclass
 class EncodedSensorStreamBatch:

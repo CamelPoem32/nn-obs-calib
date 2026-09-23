@@ -242,13 +242,32 @@ def test_build_windows_does_not_modify_original_timestamps() -> None:
 
 
 def test_build_windows_rejects_unsorted_timestamps() -> None:
+    """Raw streams must have monotonically ordered timestamps."""
+
     streams = {
-        "gyroscope": _make_stream(torch.tensor([0.0, 2.0, 1.0, 3.0, 4.0, 5.0], dtype=torch.float64)),
+        "gyroscope": _make_stream(
+            torch.tensor(
+                [0.0, 2.0, 1.0, 3.0, 4.0, 5.0],
+                dtype=torch.float64,
+            )
+        ),
         "accelerometer": _make_stream(torch.arange(0.0, 6.0)),
     }
 
-    with pytest.raises(ValueError, match="must be sorted"):
-        build_windows(streams, WindowingConfig(window_duration_s=5.0, max_samples_per_sensor=700))
+    # Accept either the older "sorted" wording or the newer, more precise
+    # "strictly increasing" wording. The test should enforce semantics rather
+    # than pin one human-readable error string.
+    with pytest.raises(
+        ValueError,
+        match=r"(sorted|strictly increasing)",
+    ):
+        build_windows(
+            streams,
+            WindowingConfig(
+                window_duration_s=5.0,
+                max_samples_per_sensor=700,
+            ),
+        )
 
 
 def test_build_windows_rejects_nonfinite_timestamps() -> None:

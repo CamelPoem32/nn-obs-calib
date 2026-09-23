@@ -1,10 +1,13 @@
-"""Execution of one complete temporal calibration window."""
+"""Single-window orchestration from raw sensor batches to updated calibration states."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from obscalib.calibration.context import CALIBRATION_CONTEXT_DIM, calibration_state_to_context
+import torch
+
+from obscalib.calibration.context import calibration_state_to_context
 from obscalib.calibration.state import CalibrationState
 from obscalib.calibration.update import CalibrationUpdater
 from obscalib.data.structures import TokenBatch, WindowBatch
@@ -13,66 +16,122 @@ from obscalib.models.obs_calib_model import ObsCalibModel
 from obscalib.models.structures import ModelOutput
 from obscalib.observability.estimators import ObservabilityEstimator
 from obscalib.observability.mappings import ObservabilityMapper
-from obscalib.observability.structures import ObservabilityResult
+from obscalib.observability.structures import BatchedObservabilityMatrix, ObservabilityResult, WindowObservabilityMatrix
 from obscalib.tokenization.tokenizer import Tokenizer
 
-import torch
 
 @dataclass
 class WindowStepResult:
     """
-    Result of processing one complete temporal window.
+    Complete output of one model-processing step.
 
-    model_output:
-        Raw deterministic predictions produced by all configured calibration
-        heads.
-
-    next_calibration:
-        Calibration states after applying the predicted left-multiplicative
-        spatial corrections and additive temporal corrections.
-
-    tokens:
-        Final chronologically sorted tokens supplied to the Transformer.
-
-    observability:
-        Optional scientific and mapped observability result used for this
-        window. None means the current experiment does not use observability.
+    ``next_calibration`` remains differentiable with respect to the current model
+    prediction when the configured ``CalibrationUpdater`` is differentiable.
     """
 
     model_output: ModelOutput
     next_calibration: dict[str, CalibrationState]
     tokens: TokenBatch
-    observability: ObservabilityResult | None = None
+    observability: ObservabilityResult | None
+
+
+def _validate_window(window: WindowBatch) -> int:
+    """
+    Validate one padded minibatch and return its batch size.
+    """
+
+    if not isinstance(window, WindowBatch):
+        raise TypeError("window must be a WindowBatch.")
+    if not window.streams:
+        raise ValueError("window.streams must not be empty.")
+    if set(window.streams) != set(window.metadata):
+        raise ValueError("window.streams and window.metadata must contain identical stream keys.")
+    if not window.current_calibration:
+        raise ValueError("window.current_calibration must not be empty.")
+
+    batch_sizes: list[int] = []
+
+    for stream in window.streams.values():
+        stream.validate()
+        batch_sizes.append(stream.values.shape[0])
+
+    for state in window.current_calibration.values():
+        state.validate()
+        batch_sizes.append(state.transform.shape[0])
+
+    if any(batch_size != batch_sizes[0] for batch_size in batch_sizes[1:]):
+        raise ValueError("All window streams and calibration states must share batch size.")
+
+    return batch_sizes[0]
+
+
+def _validate_calibration_for_window(window: WindowBatch, calibration: Mapping[str, CalibrationState], batch_size: int) -> None:
+    """
+    Validate a teacher-forced or rollout-supplied calibration mapping.
+    """
+
+    required_keys = {stream_metadata.calibration_key for stream_metadata in window.metadata.values()}
+    missing = sorted(required_keys - set(calibration))
+
+    if missing:
+        raise KeyError(f"Calibration mapping is missing keys required by sensor streams: {missing}.")
+
+    for calibration_key, state in calibration.items():
+        state.validate()
+
+        if state.transform.shape[0] != batch_size:
+            raise ValueError(f"Calibration state {calibration_key!r} must use batch size {batch_size}.")
+
+
+def _map_batched_observability(raw_result: ObservabilityResult, mapper: ObservabilityMapper) -> ObservabilityResult:
+    """
+    Apply a single-window mapper to each element of a batched Fisher result.
+
+    ``BatchedObservabilityMatrix`` stores the canonical Fisher matrices. The
+    projected Jacobians are not retained in that batched container, so mappers
+    reconstruct spectral diagnostics from each Fisher matrix when needed.
+    """
+
+    if not isinstance(raw_result.raw, BatchedObservabilityMatrix):
+        return mapper(raw_result)
+
+    batched = raw_result.raw
+    feature_rows: list[torch.Tensor] = []
+
+    for batch_index, reference_timebase in enumerate(batched.reference_timebases):
+        single_raw = WindowObservabilityMatrix(
+            fisher_information_matrix=batched.fisher_information_matrix[batch_index],
+            layout=batched.layout,
+            reference_timebase=reference_timebase,
+            projected_calibration_jacobian=None,
+        )
+        mapped = mapper(ObservabilityResult(raw=single_raw, features=None))
+
+        if mapped.features is None:
+            raise ValueError("Observability mapper must populate features.")
+        if mapped.features.ndim != 2 or mapped.features.shape[0] != 1:
+            raise ValueError("Single-window observability mapper must return features with shape [1, d_observability].")
+
+        feature_rows.append(mapped.features)
+
+    return ObservabilityResult(raw=batched, features=torch.cat(feature_rows, dim=0))
 
 
 class WindowStep:
     """
-    Coordinate all deterministic and learned operations for one temporal window.
+    Coordinate one complete temporal-window model step.
 
-    The processing order is
+    Processing order is fixed:
 
-        raw window
-            |
-            +-> optional observability computation from raw streams
-            |
-            -> GeometryProcessor
-                 spatial calibration prior
-                 Log().vee() / vector mapping
-                 additive timestamp correction
-            -> Tokenizer
-                 zero-pad canonical vectors
-                 append timestamp / type / optional observability
-                 concatenate streams
-                 chronological sort
-            -> calibration contexts [phi, rho, tau]
-            -> ObsCalibModel
-            -> CalibrationUpdater.
+        1. resolve teacher-forced or rollout calibration state,
+        2. optionally compute observability from raw sensor streams,
+        3. apply calibration priors and geometry preprocessing,
+        4. tokenize and chronologically sort measurements,
+        5. build per-head calibration contexts,
+        6. run the learned model,
+        7. update predicted calibration states.
 
-    During teacher-forced training, calibration=None uses
-    window.current_calibration.
-
-    During sequential rollout, an explicitly supplied calibration dictionary
-    overrides window.current_calibration.
+    Observability is computed from raw streams before geometry preprocessing.
     """
 
     def __init__(
@@ -87,9 +146,6 @@ class WindowStep:
         if (observability_estimator is None) != (observability_mapper is None):
             raise ValueError("observability_estimator and observability_mapper must either both be provided or both be None.")
 
-        if model.config.calibration_head.calibration_context_dim != CALIBRATION_CONTEXT_DIM:
-            raise ValueError(f"Calibration heads must use calibration_context_dim={CALIBRATION_CONTEXT_DIM} for context [phi, rho, tau].")
-
         self.geometry_processor = geometry_processor
         self.tokenizer = tokenizer
         self.model = model
@@ -97,87 +153,84 @@ class WindowStep:
         self.observability_estimator = observability_estimator
         self.observability_mapper = observability_mapper
 
-    def _resolve_calibration(self, window: WindowBatch, calibration: dict[str, CalibrationState] | None) -> dict[str, CalibrationState]:
-        """Select teacher-forced or externally carried calibration states."""
-
-        current_calibration = dict(window.current_calibration if calibration is None else calibration)
-
-        if not current_calibration:
-            raise ValueError("At least one calibration state is required.")
-
-        for calibration_key, state in current_calibration.items():
-            try:
-                state.validate()
-            except (TypeError, ValueError) as error:
-                raise ValueError(f"Invalid calibration state {calibration_key!r}.") from error
-
-        return current_calibration
-
-    def _compute_observability(self, window: WindowBatch, calibration: dict[str, CalibrationState]) -> ObservabilityResult | None:
-        """Compute and map optional observability features from the raw window."""
+    def _compute_observability(self, window: WindowBatch, calibration: Mapping[str, CalibrationState]) -> ObservabilityResult | None:
+        """
+        Compute and map optional observability features for the complete batch.
+        """
 
         if self.observability_estimator is None:
             return None
 
-        if self.observability_mapper is None:
-            raise RuntimeError("Observability mapper is missing although an estimator is configured.")
+        raw_result = self.observability_estimator(window.streams, calibration, window.metadata)
 
-        scientific_result = self.observability_estimator(window.streams, calibration)
+        if not isinstance(raw_result, ObservabilityResult):
+            raise TypeError("observability_estimator must return an ObservabilityResult.")
 
-        return self.observability_mapper(scientific_result)
+        return _map_batched_observability(raw_result, self.observability_mapper)
 
-    def _build_calibration_context(self, calibration: dict[str, CalibrationState]) -> dict[str, torch.Tensor]:
-        """Build one [B, 7] calibration context for every learned head."""
+    def _build_calibration_context(self, calibration: Mapping[str, CalibrationState]) -> dict[str, torch.Tensor]:
+        """
+        Build ``[phi, rho, tau]`` contexts for every configured model head.
+        """
 
         head_keys = tuple(self.model.heads.keys())
-        missing_calibration = set(head_keys) - set(calibration)
+        missing = sorted(set(head_keys) - set(calibration))
 
-        if missing_calibration:
-            raise KeyError(f"Missing calibration states for model heads: {sorted(missing_calibration)}")
+        if missing:
+            raise KeyError(f"Calibration mapping is missing states required by model heads: {missing}.")
 
-        return {head_key: calibration_state_to_context(calibration[head_key]) for head_key in head_keys}
+        return {
+            head_key: calibration_state_to_context(calibration[head_key])
+            for head_key in head_keys
+        }
 
-    def _update_calibration(self, calibration: dict[str, CalibrationState], model_output: ModelOutput) -> dict[str, CalibrationState]:
+    def _update_calibration(self, calibration: Mapping[str, CalibrationState], model_output: ModelOutput) -> dict[str, CalibrationState]:
         """
-        Apply predictions while carrying states without corresponding heads unchanged.
-
-        This permits fixed/reference sensor calibrations to remain in the
-        calibration dictionary without requiring a learned output head.
+        Update predicted calibration keys and preserve all fixed extra states.
         """
 
         next_calibration = dict(calibration)
 
         for calibration_key, prediction in model_output.predictions.items():
             if calibration_key not in calibration:
-                raise KeyError(f"Model produced prediction for unknown calibration key {calibration_key!r}.")
+                raise KeyError(f"Model predicted unknown calibration key {calibration_key!r}.")
 
             next_calibration[calibration_key] = self.calibration_updater.update(calibration[calibration_key], prediction)
 
         return next_calibration
 
-    def __call__(self, window: WindowBatch, calibration: dict[str, CalibrationState] | None = None) -> WindowStepResult:
-        """Process one temporal window from raw streams to updated calibration."""
+    def __call__(self, window: WindowBatch, calibration: Mapping[str, CalibrationState] | None = None) -> WindowStepResult:
+        """
+        Process one temporal window.
 
-        current_calibration = self._resolve_calibration(window, calibration)
+        ``calibration=None`` uses ``window.current_calibration`` for teacher-forced
+        training. Passing a calibration mapping explicitly enables rollout or
+        inference with externally carried state.
+        """
 
-        # Observability deliberately branches from the raw window before learned
-        # geometry/token preprocessing. This keeps future NumPy/Numba estimators
-        # independent from the neural computation graph.
+        batch_size = _validate_window(window)
+        current_calibration = window.current_calibration if calibration is None else calibration
+        _validate_calibration_for_window(window, current_calibration, batch_size)
+
         observability = self._compute_observability(window, current_calibration)
 
-        # Apply current spatial and temporal calibration priors, then convert all
-        # measurements to canonical vector representations.
         canonical_streams = self.geometry_processor(window.streams, window.metadata, current_calibration)
-
-        # Build complete measurement tokens and chronologically sort them using
-        # calibration-corrected timestamps.
         tokens = self.tokenizer(canonical_streams, observability)
+        tokens.validate()
 
-        # Each output head receives the current calibration in the fixed
-        # [phi, rho, tau] representation.
         calibration_context = self._build_calibration_context(current_calibration)
-
         model_output = self.model(tokens, calibration_context)
         next_calibration = self._update_calibration(current_calibration, model_output)
 
-        return WindowStepResult(model_output=model_output, next_calibration=next_calibration, tokens=tokens, observability=observability)
+        return WindowStepResult(
+            model_output=model_output,
+            next_calibration=next_calibration,
+            tokens=tokens,
+            observability=observability,
+        )
+
+
+__all__ = [
+    "WindowStep",
+    "WindowStepResult",
+]
