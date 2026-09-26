@@ -45,6 +45,18 @@ def _collate_sensor_streams(streams: Sequence[SensorStream]) -> SensorStreamBatc
     for stream in streams:
         stream.validate()
 
+    for window_index, stream in enumerate(streams):
+        num_samples = int(
+            stream.timestamps.numel()
+        )
+
+        if num_samples < 2:
+            raise ValueError(
+                "Every required sensor stream in a minibatch must contain at least "
+                f"two valid measurements, but window {window_index} contains "
+                f"{num_samples}."
+            )
+
     sample_shape = streams[0].values.shape[1:]
     values_dtype = streams[0].values.dtype
     timestamp_dtype = streams[0].timestamps.dtype

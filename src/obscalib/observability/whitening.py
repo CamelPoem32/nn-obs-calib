@@ -25,6 +25,47 @@ class WhitenedFactorLinearization:
     nuisance_jacobian: torch.Tensor
     calibration_jacobian: torch.Tensor
 
+    def validate(self) -> None:
+        """Validate one whitened factor block."""
+
+        if self.residual.device.type != "cpu" or self.residual.requires_grad or self.residual.dtype != torch.float64:
+            raise ValueError("Whitened residual must be detached CPU float64.")
+
+        if self.trajectory_jacobian.device.type != "cpu" or self.trajectory_jacobian.requires_grad or self.trajectory_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened trajectory Jacobian must be detached CPU float64.")
+
+        if self.nuisance_jacobian.device.type != "cpu" or self.nuisance_jacobian.requires_grad or self.nuisance_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened nuisance Jacobian must be detached CPU float64.")
+
+        if self.calibration_jacobian.device.type != "cpu" or self.calibration_jacobian.requires_grad or self.calibration_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened calibration Jacobian must be detached CPU float64.")
+
+        if self.residual.ndim != 1:
+            raise ValueError("Whitened residual must have shape [R].")
+
+        residual_dimension = self.residual.shape[0]
+
+        if self.trajectory_jacobian.ndim != 2 or self.trajectory_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened trajectory Jacobian must have shape [R, D_trajectory].")
+
+        if self.nuisance_jacobian.ndim != 2 or self.nuisance_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened nuisance Jacobian must have shape [R, D_nuisance].")
+
+        if self.calibration_jacobian.ndim != 2 or self.calibration_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened calibration Jacobian must have shape [R, D_calibration].")
+
+        if not torch.isfinite(self.residual).all():
+            raise ValueError("Whitened residual must contain only finite values.")
+
+        if not torch.isfinite(self.trajectory_jacobian).all():
+            raise ValueError("Whitened trajectory Jacobian must contain only finite values.")
+
+        if not torch.isfinite(self.nuisance_jacobian).all():
+            raise ValueError("Whitened nuisance Jacobian must contain only finite values.")
+
+        if not torch.isfinite(self.calibration_jacobian).all():
+            raise ValueError("Whitened calibration Jacobian must contain only finite values.")
+
 
 @dataclass(frozen=True)
 class WhitenedWindowLinearization:
@@ -34,6 +75,47 @@ class WhitenedWindowLinearization:
     trajectory_jacobian: torch.Tensor
     nuisance_jacobian: torch.Tensor
     calibration_jacobian: torch.Tensor
+
+    def validate(self) -> None:
+        """Validate the stacked whitened one-window system."""
+
+        if self.residual.device.type != "cpu" or self.residual.requires_grad or self.residual.dtype != torch.float64:
+            raise ValueError("Whitened residual must be detached CPU float64.")
+
+        if self.trajectory_jacobian.device.type != "cpu" or self.trajectory_jacobian.requires_grad or self.trajectory_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened trajectory Jacobian must be detached CPU float64.")
+
+        if self.nuisance_jacobian.device.type != "cpu" or self.nuisance_jacobian.requires_grad or self.nuisance_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened nuisance Jacobian must be detached CPU float64.")
+
+        if self.calibration_jacobian.device.type != "cpu" or self.calibration_jacobian.requires_grad or self.calibration_jacobian.dtype != torch.float64:
+            raise ValueError("Whitened calibration Jacobian must be detached CPU float64.")
+
+        if self.residual.ndim != 1:
+            raise ValueError("Whitened residual must have shape [R_total].")
+
+        residual_dimension = self.residual.shape[0]
+
+        if self.trajectory_jacobian.ndim != 2 or self.trajectory_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened trajectory Jacobian must have shape [R_total, D_trajectory].")
+
+        if self.nuisance_jacobian.ndim != 2 or self.nuisance_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened nuisance Jacobian must have shape [R_total, D_nuisance].")
+
+        if self.calibration_jacobian.ndim != 2 or self.calibration_jacobian.shape[0] != residual_dimension:
+            raise ValueError("Whitened calibration Jacobian must have shape [R_total, D_calibration].")
+
+        if not torch.isfinite(self.residual).all():
+            raise ValueError("Whitened residual must contain only finite values.")
+
+        if not torch.isfinite(self.trajectory_jacobian).all():
+            raise ValueError("Whitened trajectory Jacobian must contain only finite values.")
+
+        if not torch.isfinite(self.nuisance_jacobian).all():
+            raise ValueError("Whitened nuisance Jacobian must contain only finite values.")
+
+        if not torch.isfinite(self.calibration_jacobian).all():
+            raise ValueError("Whitened calibration Jacobian must contain only finite values.")
 
 
 def _validate_covariance_once(covariance: torch.Tensor, residual_dimension: int, stream_key: str) -> torch.Tensor:

@@ -498,7 +498,7 @@ def _trajectory_index_for_time(trajectory_layout: TrajectoryParameterLayout, tim
     return index
 
 
-def linearize_gyroscope_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, *, gyro_bias: torch.Tensor | None = None, residual_covariance: torch.Tensor | None = None, njit: bool = False) -> tuple[SensorFactorLinearization, ...]:
+def linearize_gyroscope_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, *, gyro_bias: torch.Tensor | None = None, residual_covariance: torch.Tensor | None = None, njit: bool = False, validate_factor_outputs: bool = True) -> tuple[SensorFactorLinearization, ...]:
     """Linearize every supported trajectory interval for one gyroscope stream.
 
     ``njit=False`` keeps the canonical Torch reference path. ``njit=True`` uses
@@ -580,12 +580,13 @@ def linearize_gyroscope_stream(stream_key: str, stream: SensorStream, stream_met
         calibration_jacobian[:, calibration_block.time_offset_slice] = H_tau_I
 
         factor = SensorFactorLinearization(stream_key=stream_key, calibration_key=stream_metadata.calibration_key, residual=residual, trajectory_jacobian=trajectory_jacobian, calibration_jacobian=calibration_jacobian, residual_covariance=residual_covariance, nuisance_jacobian=nuisance_jacobian, measurement_type=MeasurementType.IMU_GYROSCOPE, factor_index=interval_index)
-        factor.validate()
+        if validate_factor_outputs:
+            factor.validate()
         factors.append(factor)
 
     return tuple(factors)
 
-def linearize_accelerometer_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, trajectory_spatial_twists: torch.Tensor, supports: tuple[AccelerometerSampleSupport, ...], gravity_world: torch.Tensor, *, residual_covariance: torch.Tensor | None = None) -> tuple[SensorFactorLinearization, ...]:
+def linearize_accelerometer_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, trajectory_spatial_twists: torch.Tensor, supports: tuple[AccelerometerSampleSupport, ...], gravity_world: torch.Tensor, *, residual_covariance: torch.Tensor | None = None, validate_factor_outputs: bool = True) -> tuple[SensorFactorLinearization, ...]:
     """Linearize the selected simple accelerometer factors for one stream.
 
     One actual accelerometer sample is selected near each reference timestamp.
@@ -619,13 +620,14 @@ def linearize_accelerometer_stream(stream_key: str, stream: SensorStream, stream
         calibration_jacobian[:, calibration_block.time_offset_slice] = local.H_tau_I
 
         factor = SensorFactorLinearization(stream_key=stream_key, calibration_key=stream_metadata.calibration_key, residual=local.residual, trajectory_jacobian=trajectory_jacobian, calibration_jacobian=calibration_jacobian, residual_covariance=residual_covariance, nuisance_jacobian=nuisance_jacobian, measurement_type=MeasurementType.IMU_ACCELEROMETER, factor_index=support.sample_index)
-        factor.validate()
+        if validate_factor_outputs:
+            factor.validate()
         factors.append(factor)
 
     return tuple(factors)
 
 
-def linearize_lidar_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, trajectory_spatial_twists: torch.Tensor, supports: tuple[LidarIntervalSupport, ...], *, residual_covariance: torch.Tensor | None = None, njit: bool = False) -> tuple[SensorFactorLinearization, ...]:
+def linearize_lidar_stream(stream_key: str, stream: SensorStream, stream_metadata: SensorMetadata, calibration_state: CalibrationState, calibration_layout: CalibrationParameterLayout, nuisance_layout: NuisanceParameterLayout, trajectory_layout: TrajectoryParameterLayout, trajectory_poses: torch.Tensor, trajectory_spatial_twists: torch.Tensor, supports: tuple[LidarIntervalSupport, ...], *, residual_covariance: torch.Tensor | None = None, njit: bool = False, validate_factor_outputs: bool = True) -> tuple[SensorFactorLinearization, ...]:
     """Linearize all supported LiDAR relative-pose factors for one stream.
 
     ``njit=False`` keeps the canonical Torch reference path. ``njit=True`` uses
@@ -679,7 +681,8 @@ def linearize_lidar_stream(stream_key: str, stream: SensorStream, stream_metadat
         calibration_jacobian[:, calibration_block.time_offset_slice] = H_tau_L
 
         factor = SensorFactorLinearization(stream_key=stream_key, calibration_key=stream_metadata.calibration_key, residual=residual, trajectory_jacobian=trajectory_jacobian, calibration_jacobian=calibration_jacobian, residual_covariance=residual_covariance, nuisance_jacobian=nuisance_jacobian, measurement_type=MeasurementType.LIDAR_POSE, factor_index=support.measurement_index)
-        factor.validate()
+        if validate_factor_outputs:
+            factor.validate()
         factors.append(factor)
 
     return tuple(factors)
@@ -720,7 +723,7 @@ def linearize_gyroscope_factors_single_window(measurements: Mapping[str, SensorS
 
         gyro_bias = _gyroscope_bias_for_key(gyro_bias_by_calibration_key, stream_metadata.calibration_key)
         residual_covariance = _residual_covariance_for_stream(residual_covariance_by_stream, stream_key, 3)
-        factors.extend(linearize_gyroscope_stream(stream_key, measurements[stream_key], stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, gyro_bias=gyro_bias, residual_covariance=residual_covariance, njit=njit))
+        factors.extend(linearize_gyroscope_stream(stream_key, measurements[stream_key], stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, gyro_bias=gyro_bias, residual_covariance=residual_covariance, njit=njit, validate_factor_outputs=not njit))
 
     if not factors:
         raise ValueError("No supported gyroscope factors could be constructed for this window.")
@@ -817,7 +820,7 @@ def linearize_single_window(measurements: Mapping[str, SensorStream], metadata: 
         if stream_metadata.measurement_type == MeasurementType.IMU_GYROSCOPE:
             gyro_bias = _gyroscope_bias_for_key(gyro_bias_by_calibration_key, stream_metadata.calibration_key)
             residual_covariance = _residual_covariance_for_stream(residual_covariance_by_stream, stream_key, 3)
-            factors.extend(linearize_gyroscope_stream(stream_key, stream, stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, gyro_bias=gyro_bias, residual_covariance=residual_covariance, njit=njit))
+            factors.extend(linearize_gyroscope_stream(stream_key, stream, stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, gyro_bias=gyro_bias, residual_covariance=residual_covariance, njit=njit, validate_factor_outputs=not njit))
 
         elif stream_metadata.measurement_type == MeasurementType.IMU_ACCELEROMETER:
             residual_covariance = _residual_covariance_for_stream(residual_covariance_by_stream, stream_key, 3)
@@ -825,7 +828,7 @@ def linearize_single_window(measurements: Mapping[str, SensorStream], metadata: 
 
         elif stream_metadata.measurement_type == MeasurementType.LIDAR_POSE:
             residual_covariance = _residual_covariance_for_stream(residual_covariance_by_stream, stream_key, 6)
-            factors.extend(linearize_lidar_stream(stream_key, stream, stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, trajectory_spatial_twists, lidar_support_by_stream[stream_key], residual_covariance=residual_covariance, njit=njit))
+            factors.extend(linearize_lidar_stream(stream_key, stream, stream_metadata, calibration[stream_metadata.calibration_key], calibration_layout, nuisance_layout, trajectory_layout, trajectory_poses_scientific, trajectory_spatial_twists, lidar_support_by_stream[stream_key], residual_covariance=residual_covariance, njit=njit, validate_factor_outputs=not njit))
 
     if not factors:
         raise ValueError("No supported sensor factors could be constructed for this window.")

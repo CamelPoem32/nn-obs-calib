@@ -84,37 +84,51 @@ def _validate_calibration_for_window(window: WindowBatch, calibration: Mapping[s
 
 
 def _map_batched_observability(raw_result: ObservabilityResult, mapper: ObservabilityMapper) -> ObservabilityResult:
-    """
-    Apply a single-window mapper to each element of a batched Fisher result.
-
-    ``BatchedObservabilityMatrix`` stores the canonical Fisher matrices. The
-    projected Jacobians are not retained in that batched container, so mappers
-    reconstruct spectral diagnostics from each Fisher matrix when needed.
-    """
+    """Apply a single-window mapper to each element of a batched Fisher result and reassemble both global and calibration-local neural features."""
 
     if not isinstance(raw_result.raw, BatchedObservabilityMatrix):
         return mapper(raw_result)
 
     batched = raw_result.raw
     feature_rows: list[torch.Tensor] = []
+    calibration_feature_rows: dict[str, list[torch.Tensor]] = {}
+    calibration_feature_mode: bool | None = None
 
     for batch_index, reference_timebase in enumerate(batched.reference_timebases):
-        single_raw = WindowObservabilityMatrix(
-            fisher_information_matrix=batched.fisher_information_matrix[batch_index],
-            layout=batched.layout,
-            reference_timebase=reference_timebase,
-            projected_calibration_jacobian=None,
-        )
-        mapped = mapper(ObservabilityResult(raw=single_raw, features=None))
+        marginalized_nuisance_layout = None if batched.marginalized_nuisance_layouts is None else batched.marginalized_nuisance_layouts[batch_index]
+        single_raw = WindowObservabilityMatrix(fisher_information_matrix=batched.fisher_information_matrix[batch_index], layout=batched.layout, reference_timebase=reference_timebase, projected_calibration_jacobian=None, marginalized_nuisance_layout=marginalized_nuisance_layout)
+        mapped = mapper(ObservabilityResult(raw=single_raw, features=None, calibration_features=None))
 
         if mapped.features is None:
             raise ValueError("Observability mapper must populate features.")
+
         if mapped.features.ndim != 2 or mapped.features.shape[0] != 1:
             raise ValueError("Single-window observability mapper must return features with shape [1, d_observability].")
 
         feature_rows.append(mapped.features)
 
-    return ObservabilityResult(raw=batched, features=torch.cat(feature_rows, dim=0))
+        has_calibration_features = mapped.calibration_features is not None
+
+        if calibration_feature_mode is None:
+            calibration_feature_mode = has_calibration_features
+            if has_calibration_features:
+                calibration_feature_rows = {calibration_key: [] for calibration_key in mapped.calibration_features}
+        elif calibration_feature_mode != has_calibration_features:
+            raise ValueError("Observability mapper returned calibration-local features inconsistently across batch elements.")
+
+        if has_calibration_features:
+            if set(mapped.calibration_features) != set(calibration_feature_rows):
+                raise ValueError("Observability mapper returned inconsistent calibration feature keys across batch elements.")
+
+            for calibration_key, calibration_feature in mapped.calibration_features.items():
+                if calibration_feature.ndim != 2 or calibration_feature.shape[0] != 1:
+                    raise ValueError(f"Calibration-local observability feature {calibration_key!r} must have shape [1, d_calibration_observability].")
+
+                calibration_feature_rows[calibration_key].append(calibration_feature)
+
+    calibration_features = None if not calibration_feature_mode else {calibration_key: torch.cat(rows, dim=0) for calibration_key, rows in calibration_feature_rows.items()}
+
+    return ObservabilityResult(raw=batched, features=torch.cat(feature_rows, dim=0), calibration_features=calibration_features)
 
 
 class WindowStep:
@@ -215,7 +229,7 @@ class WindowStep:
         observability = self._compute_observability(window, current_calibration)
 
         canonical_streams = self.geometry_processor(window.streams, window.metadata, current_calibration)
-        tokens = self.tokenizer(canonical_streams, observability)
+        tokens = self.tokenizer(canonical_streams, observability, metadata=window.metadata)
         tokens.validate()
 
         calibration_context = self._build_calibration_context(current_calibration)

@@ -9,6 +9,7 @@ import torch
 
 from obscalib.calibration.state import CalibrationState
 
+MINIMUM_REQUIRED_SAMPLES_PER_STREAM = 10
 
 class MeasurementType(IntEnum):
     """
@@ -237,9 +238,13 @@ class SensorMetadata:
         Mathematical representation used by the geometry preprocessing block.
 
     calibration_key:
-        Internal key selecting T_sensor_in_world for this physical sensor.
-        This key is used only for preprocessing and is never exposed to the
-        Transformer.
+        Internal key selecting the carried calibration state associated with
+        this physical sensor.
+
+        The key is used by geometry preprocessing and also routes
+        calibration-local observability features to the corresponding
+        measurement tokens. The string key itself is not exposed numerically
+        to the Transformer.
 
         Multiple streams may share one calibration key, for example the
         gyroscope and accelerometer belonging to the same IMU.

@@ -14,6 +14,7 @@ from obscalib.data.structures import CalibrationTargetBatch
 from obscalib.geometry import se3_log, so3_exp, so3_log
 from obscalib.losses.structures import LossComponents, combine_loss_components
 from obscalib.models.structures import CalibrationPrediction
+from obscalib.observability.structures import ObservabilityResult
 
 
 class CalibrationLoss(nn.Module):
@@ -43,10 +44,17 @@ class CalibrationLoss(nn.Module):
 
         self.config = config
 
-    def forward(self, predictions: Mapping[str, CalibrationPrediction], current_calibration: Mapping[str, CalibrationState], targets: Mapping[str, CalibrationTargetBatch]) -> LossComponents:
+    def forward(self, predictions: Mapping[str, CalibrationPrediction], current_calibration: Mapping[str, CalibrationState], targets: Mapping[str, CalibrationTargetBatch], observability: ObservabilityResult | None = None) -> LossComponents:
         """Compute and aggregate losses over all calibration prediction heads."""
 
         calibration_keys = self._validate_keys(predictions, current_calibration, targets)
+
+        if self.config.correction_loss_mode == "observability_aware":
+            if observability is None:
+                raise ValueError("observability must be provided when correction_loss_mode='observability_aware'.")
+
+            if observability.calibration_features is None:
+                raise ValueError("observability.calibration_features must be populated when correction_loss_mode='observability_aware'.")
 
         rotation_losses: list[torch.Tensor] = []
         translation_losses: list[torch.Tensor] = []
@@ -63,7 +71,6 @@ class CalibrationLoss(nn.Module):
             target.validate()
 
             next_transform, next_time_offset, change_label, change_time = self._require_target_fields(calibration_key, target)
-
             self._validate_prediction_and_target_shapes(calibration_key, prediction, current_state, next_transform, next_time_offset, change_label, change_time)
 
             target_delta_transform = next_transform @ torch.linalg.inv(current_state.transform)
@@ -75,9 +82,16 @@ class CalibrationLoss(nn.Module):
             target_phi = target_delta_xi[..., :3]
             target_rho = target_delta_xi[..., 3:]
 
-            rotation_losses.append(self._rotation_loss(predicted_phi, target_phi))
-            translation_losses.append(self._translation_loss(predicted_rho, target_rho))
-            time_offset_losses.append(self._time_offset_loss(prediction.delta_tau, target_delta_tau))
+            if self.config.correction_loss_mode == "standard":
+                rotation_losses.append(self._rotation_loss(predicted_phi, target_phi))
+                translation_losses.append(self._translation_loss(predicted_rho, target_rho))
+                time_offset_losses.append(self._time_offset_loss(prediction.delta_tau, target_delta_tau))
+            else:
+                calibration_observability = self._require_calibration_observability(calibration_key, observability, prediction.delta_xi.shape[0], prediction.delta_xi)
+                rotation_losses.append(self._observability_aware_rotation_loss(predicted_phi, target_phi, calibration_observability[..., :3]))
+                translation_losses.append(self._observability_aware_translation_loss(predicted_rho, target_rho, calibration_observability[..., 3:6]))
+                time_offset_losses.append(self._observability_aware_time_offset_loss(prediction.delta_tau, target_delta_tau, calibration_observability[..., 6:7]))
+
             change_event_losses.append(self._change_event_loss(prediction.change_event_logit, change_label))
             change_time_losses.append(self._change_time_loss(prediction.change_time, change_time, change_label))
 
@@ -87,9 +101,6 @@ class CalibrationLoss(nn.Module):
         change_event = torch.stack(change_event_losses).mean()
         change_time = torch.stack(change_time_losses).mean()
 
-        # Reserved for a possible future temporal smoothness / burst penalty.
-        # Keeping the term in the interface allows the experiment to be enabled
-        # later without changing training logs or the loss aggregation contract.
         consistency = rotation * 0.0
 
         components = LossComponents(rotation=rotation, translation=translation, time_offset=time_offset, change_event=change_event, change_time=change_time, consistency=consistency)
@@ -131,6 +142,58 @@ class CalibrationLoss(nn.Module):
         error_delta_tau = predicted_delta_tau - target_delta_tau
 
         return torch.mean(error_delta_tau * error_delta_tau)
+
+    def _require_calibration_observability(self, calibration_key: str, observability: ObservabilityResult, batch_size: int, reference_tensor: torch.Tensor) -> torch.Tensor:
+        """Return one validated [phi, rho, tau] observability block for a calibration head."""
+
+        if observability.calibration_features is None:
+            raise ValueError("observability.calibration_features must be populated.")
+
+        if calibration_key not in observability.calibration_features:
+            raise KeyError(f"Observability features are missing calibration key {calibration_key!r}.")
+
+        calibration_observability = observability.calibration_features[calibration_key]
+
+        if calibration_observability.shape != (batch_size, 7):
+            raise ValueError(f"Observability features for {calibration_key!r} must have shape [B, 7].")
+
+        if not torch.isfinite(calibration_observability).all():
+            raise ValueError(f"Observability features for {calibration_key!r} must be finite.")
+
+        if torch.any(calibration_observability < 0.0) or torch.any(calibration_observability > 1.0):
+            raise ValueError(f"Observability features for {calibration_key!r} must lie in [0, 1].")
+
+        return calibration_observability.detach().to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+
+    def _observability_aware_rotation_loss(self, predicted_phi: torch.Tensor, target_phi: torch.Tensor, observability_phi: torch.Tensor) -> torch.Tensor:
+        """Blend target-correction and hold-state rotation losses coordinate-wise."""
+
+        predicted_rotation = so3_exp(predicted_phi)
+        target_rotation = so3_exp(target_phi)
+        target_error_phi = so3_log(predicted_rotation @ target_rotation.transpose(-1, -2))
+        hold_error_phi = so3_log(predicted_rotation)
+        target_loss = observability_phi * target_error_phi.square()
+        hold_loss = (1.0 - observability_phi) * hold_error_phi.square()
+
+        return torch.sum(target_loss + self.config.observability_hold_weight * hold_loss, dim=-1).mean()
+
+    def _observability_aware_translation_loss(self, predicted_rho: torch.Tensor, target_rho: torch.Tensor, observability_rho: torch.Tensor) -> torch.Tensor:
+        """Blend target-correction and hold-state translation losses coordinate-wise."""
+
+        target_error_rho = predicted_rho - target_rho
+        target_loss = observability_rho * target_error_rho.square()
+        hold_loss = (1.0 - observability_rho) * predicted_rho.square()
+
+        return torch.sum(target_loss + self.config.observability_hold_weight * hold_loss, dim=-1).mean()
+
+    def _observability_aware_time_offset_loss(self, predicted_delta_tau: torch.Tensor, target_delta_tau: torch.Tensor, observability_tau: torch.Tensor) -> torch.Tensor:
+        """Blend target-correction and hold-state temporal losses coordinate-wise."""
+
+        target_error_tau = predicted_delta_tau - target_delta_tau
+        target_loss = observability_tau * target_error_tau.square()
+        hold_loss = (1.0 - observability_tau) * predicted_delta_tau.square()
+
+        return torch.mean(target_loss + self.config.observability_hold_weight * hold_loss)
 
     def _change_event_loss(self, change_event_logit: torch.Tensor, change_label: torch.Tensor) -> torch.Tensor:
         """Compute binary change-event classification loss directly from logits."""

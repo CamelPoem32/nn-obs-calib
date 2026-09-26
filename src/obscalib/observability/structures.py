@@ -15,7 +15,7 @@ from obscalib.observability.timebase import ReferenceTimebase
 
 @dataclass
 class ObservabilityResult:
-    '''Scientific observability output and optional window-level NN features.
+    '''Scientific observability output and optional neural-network features.
 
     raw:
         Strategy-specific scientific result. The intended default is a
@@ -23,24 +23,38 @@ class ObservabilityResult:
         the complete calibration Fisher information matrix.
 
     features:
-        Optional network-ready observability representation with shape
+        Optional complete window-level network representation with shape
 
-            [B, d_observability]
+            [B, d_observability].
 
-        One vector is computed per temporal window and is later repeated
-        across measurements belonging to that window.
+        This preserves the complete mapped representation in deterministic
+        CalibrationParameterLayout order and remains useful for diagnostics,
+        visualization, and mappings that are naturally window-global.
 
-        None means that the current experiment does not use observability
-        features.
+    calibration_features:
+        Optional calibration-local network representation
 
-    A separate ObservabilityMapper converts the raw scientific structure
-    into neural features. The estimator therefore does not need to discard
-    matrix structure or numerical metadata required by scientific
-    diagnostics.
+            calibration_key -> [B, d_calibration_observability].
+
+        For the coordinate-wise CRLBTanh mapping each calibration key receives
+        exactly seven values ordered as
+
+            [phi_x, phi_y, phi_z, rho_x, rho_y, rho_z, tau].
+
+        These calibration-local features are used for sensor-local token
+        conditioning and observability-aware correction losses.
+
+        None means that the selected observability mapping does not provide
+        calibration-local features.
+
+    A separate ObservabilityMapper converts the raw scientific structure into
+    neural features. The estimator therefore does not need to discard matrix
+    structure or numerical metadata required by scientific diagnostics.
     '''
 
     raw: object | None = None
     features: torch.Tensor | None = None
+    calibration_features: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)

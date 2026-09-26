@@ -108,6 +108,8 @@ class CalibrationLossConfig:
     weights: LossWeights = field(default_factory=LossWeights)
     change_time_beta_s: float = 0.1
     change_positive_weight: float = 1.0
+    correction_loss_mode: str = "standard"
+    observability_hold_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if self.change_time_beta_s <= 0.0:
@@ -115,6 +117,12 @@ class CalibrationLossConfig:
 
         if self.change_positive_weight <= 0.0:
             raise ValueError(f"change_positive_weight must be positive, got {self.change_positive_weight}.")
+
+        if self.correction_loss_mode not in {"standard", "observability_aware"}:
+            raise ValueError("correction_loss_mode must be 'standard' or 'observability_aware'.")
+
+        if self.observability_hold_weight < 0.0:
+            raise ValueError(f"observability_hold_weight must be nonnegative, got {self.observability_hold_weight}.")
 
 
 @dataclass(frozen=True)

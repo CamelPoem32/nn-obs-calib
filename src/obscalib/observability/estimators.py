@@ -182,6 +182,43 @@ def _select_tensor_mapping(
         for key, value in mapping.items()
     }
 
+def _select_single_sensor_stream(stream: SensorStreamBatch, batch_index: int) -> SensorStream:
+    """
+    Extract one unpadded scientific sensor stream from a minibatch.
+
+    Padding belongs only to the neural minibatch representation and must never
+    enter the scientific observability pipeline.
+    """
+
+    stream.validate()
+
+    valid_mask = stream.sample_mask[
+        batch_index
+    ]
+
+    values = stream.values[
+        batch_index,
+        valid_mask,
+    ]
+
+    timestamps = stream.timestamps[
+        batch_index,
+        valid_mask,
+    ]
+
+    if stream.interval_start_timestamps is None:
+        interval_start_timestamps = None
+    else:
+        interval_start_timestamps = stream.interval_start_timestamps[
+            batch_index,
+            valid_mask,
+        ]
+
+    return SensorStream(
+        values=values,
+        timestamps=timestamps,
+        interval_start_timestamps=interval_start_timestamps,
+    )
 
 class ObservabilityMatrixEstimator(ObservabilityEstimator):
     """
@@ -309,6 +346,118 @@ class ObservabilityMatrixEstimator(ObservabilityEstimator):
 
             if self.gravity_world is not None:
                 gravity_world = _select_batched_tensor(self.gravity_world, batch_index, unbatched_ndim=1, name="gravity_world")
+
+            ##################################################
+            # Scientific CPU boundary
+            ##################################################
+
+            single_measurements = {
+                stream_key: _select_single_sensor_stream(
+                    stream,
+                    batch_index,
+                )
+                for stream_key, stream in measurements.items()
+            }
+
+            single_measurements = {
+                stream_key: SensorStream(
+                    values=stream.values.detach().to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    ),
+                    timestamps=stream.timestamps.detach().to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    ),
+                    interval_start_timestamps=(
+                        None
+                        if stream.interval_start_timestamps is None
+                        else stream.interval_start_timestamps.detach().to(
+                            device="cpu",
+                            dtype=torch.float64,
+                        )
+                    ),
+                )
+                for stream_key, stream in single_measurements.items()
+            }
+
+            single_calibration = {
+                calibration_key: CalibrationState(
+                    transform=state.transform.detach().to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    ),
+                    time_offset=state.time_offset.detach().to(
+                        device="cpu",
+                        dtype=torch.float64,
+                    ),
+                )
+                for calibration_key, state in single_calibration.items()
+            }
+
+            residual_covariances = {
+                stream_key: covariance.detach().to(
+                    device="cpu",
+                    dtype=torch.float64,
+                )
+                for stream_key, covariance in residual_covariances.items()
+            }
+
+            gyro_biases = {
+                calibration_key: bias.detach().to(
+                    device="cpu",
+                    dtype=torch.float64,
+                )
+                for calibration_key, bias in gyro_biases.items()
+            }
+
+            if gravity_world is not None:
+                gravity_world = gravity_world.detach().to(
+                    device="cpu",
+                    dtype=torch.float64,
+                )
+
+            for stream_key, stream in single_measurements.items():
+                timestamps = stream.timestamps
+
+                if timestamps.numel() > 1:
+                    bad = timestamps[1:] <= timestamps[:-1]
+
+                    if torch.any(bad):
+                        bad_indices = torch.nonzero(
+                            bad,
+                            as_tuple=False,
+                        ).squeeze(-1)
+
+                        print()
+                        print("BAD TIMESTAMPS")
+                        print("batch_index:", batch_index)
+                        print("stream:", stream_key)
+                        print("num samples:", timestamps.numel())
+                        print("bad indices:", bad_indices[:10].tolist())
+
+                        first_bad = int(
+                            bad_indices[0].item()
+                        )
+
+                        lo = max(
+                            0,
+                            first_bad - 3,
+                        )
+
+                        hi = min(
+                            timestamps.numel(),
+                            first_bad + 5,
+                        )
+
+                        print(
+                            "timestamps around first violation:",
+                            timestamps[lo:hi],
+                        )
+
+                        raise RuntimeError(
+                            "Debug stop: non-increasing timestamps reached observability."
+                        )
 
             window_results.append(
                 self._estimate_single_window(

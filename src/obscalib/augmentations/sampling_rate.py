@@ -8,8 +8,8 @@ from collections.abc import Mapping
 import torch
 
 from obscalib.augmentations.config import SamplingRateAugmentationConfig
-from obscalib.data.structures import GeometryType, MeasurementType, SensorMetadata, SensorStreamBatch, WindowBatch
 
+from obscalib.data.structures import GeometryType, MeasurementType, MINIMUM_REQUIRED_SAMPLES_PER_STREAM, SensorMetadata, SensorStreamBatch, WindowBatch
 
 _IMU_MEASUREMENT_TYPES = {
     MeasurementType.IMU_GYROSCOPE,
@@ -189,7 +189,7 @@ def _augment_imu_stream(stream: SensorStreamBatch, target_frequencies: list[floa
 
 
 def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: float, probability: float, generator: torch.Generator | None) -> tuple[SensorStreamBatch, torch.Tensor, torch.Tensor]:
-    """Reduce one relative SE3 LiDAR stream by retaining fewer scans and composing relative transforms."""
+    """Reduce one relative SE3 LiDAR stream while preserving at least two valid relative measurements per batch item."""
 
     stream.validate()
 
@@ -212,6 +212,9 @@ def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: fl
         end_timestamps = stream.timestamps[batch_index, sample_mask]
         start_timestamps = stream.interval_start_timestamps[batch_index, sample_mask]
 
+        if values.shape[0] < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
+            raise ValueError(f"LiDAR batch item {batch_index} contains only {values.shape[0]} valid relative measurements before sampling-rate augmentation.")
+
         source_frequency = _estimate_interval_frequency(start_timestamps, end_timestamps)
 
         if source_frequency is not None:
@@ -225,9 +228,21 @@ def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: fl
 
         reduced_values, reduced_end_timestamps, reduced_start_timestamps = _reduce_relative_se3_scan_rate(values, start_timestamps, end_timestamps, target_frequency)
 
+        # Reject this particular augmentation realization if it would leave fewer than two relative measurements. Keep the original stream instead.
+        if reduced_values.shape[0] < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
+            samples.append((values, end_timestamps, start_timestamps))
+            continue
+
+        augmentation_applied = reduced_values.shape[0] < values.shape[0]
+
+        # If the sampled target frequency happened to retain the complete original stream, record this item as not augmented and keep the original frequency record.
+        if not augmentation_applied:
+            samples.append((values, end_timestamps, start_timestamps))
+            continue
+
         samples.append((reduced_values, reduced_end_timestamps, reduced_start_timestamps))
         target_frequency_record[batch_index, 0] = target_frequency
-        applied_record[batch_index, 0] = reduced_values.shape[0] < values.shape[0]
+        applied_record[batch_index, 0] = True
 
     return _pack_samples(samples), target_frequency_record, applied_record
 
@@ -263,12 +278,12 @@ def _linear_resample(values: torch.Tensor, timestamps: torch.Tensor, target_freq
 
 
 def _reduce_relative_se3_scan_rate(values: torch.Tensor, start_timestamps: torch.Tensor, end_timestamps: torch.Tensor, target_frequency_hz: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reduce LiDAR scan rate while preserving total relative motion by SE3 composition."""
+    """Reduce LiDAR scan rate while preserving total relative motion and at least two relative measurements."""
 
     if values.shape[0] != start_timestamps.shape[0] or values.shape[0] != end_timestamps.shape[0]:
         raise ValueError("LiDAR values and interval timestamps must share N.")
 
-    if values.shape[0] < 2:
+    if values.shape[0] < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
         return values, end_timestamps, start_timestamps
 
     if not torch.allclose(end_timestamps[:-1], start_timestamps[1:], rtol=0.0, atol=_timestamp_tolerance(end_timestamps)):
@@ -287,6 +302,10 @@ def _reduce_relative_se3_scan_rate(values: torch.Tensor, start_timestamps: torch
         retained_scan_indices = torch.cat((retained_scan_indices, retained_scan_indices.new_tensor([final_scan_index])))
 
     retained_scan_indices = torch.unique_consecutive(retained_scan_indices)
+
+    # Two relative measurements require at least three retained scan timestamps.
+    if retained_scan_indices.numel() < MINIMUM_REQUIRED_SAMPLES_PER_STREAM + 1:
+        return values, end_timestamps, start_timestamps
 
     composed_values: list[torch.Tensor] = []
     reduced_start_timestamps: list[torch.Tensor] = []
@@ -308,7 +327,7 @@ def _reduce_relative_se3_scan_rate(values: torch.Tensor, start_timestamps: torch
         reduced_start_timestamps.append(scan_timestamps[first_scan_index])
         reduced_end_timestamps.append(scan_timestamps[last_scan_index])
 
-    if not composed_values:
+    if len(composed_values) < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
         return values, end_timestamps, start_timestamps
 
     return torch.stack(composed_values), torch.stack(reduced_end_timestamps), torch.stack(reduced_start_timestamps)
@@ -397,6 +416,9 @@ def _pack_samples(samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor |
     has_interval_starts = samples[0][2] is not None
 
     for values, timestamps, interval_start_timestamps in samples:
+        if timestamps.numel() < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
+            raise ValueError(f"Sampling-rate augmentation produced a stream with only {timestamps.numel()} valid measurements; at least {MINIMUM_REQUIRED_SAMPLES_PER_STREAM} are required.")
+
         if values.shape[1:] != sample_shape:
             raise ValueError("All batch items must share the same measurement shape.")
 
@@ -486,6 +508,13 @@ def _validate_window(window: WindowBatch) -> None:
 
         if stream.values.shape[0] != batch_size:
             raise ValueError(f"Stream {stream_key!r} does not share the common batch size.")
+
+        valid_samples_per_batch_item = stream.sample_mask.sum(dim=1)
+        invalid_batch_indices = torch.nonzero(valid_samples_per_batch_item < MINIMUM_REQUIRED_SAMPLES_PER_STREAM, as_tuple=False).squeeze(-1)
+
+        if invalid_batch_indices.numel() > 0:
+            invalid_counts = valid_samples_per_batch_item[invalid_batch_indices]
+            raise ValueError(f"Every required sensor stream must contain at least {MINIMUM_REQUIRED_SAMPLES_PER_STREAM} valid measurements before sampling-rate augmentation. Stream {stream_key!r} has invalid batch indices {invalid_batch_indices.tolist()} with counts {invalid_counts.tolist()}.")
 
 
 def _validate_generator(generator: torch.Generator | None) -> None:

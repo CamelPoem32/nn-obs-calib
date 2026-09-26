@@ -63,24 +63,3 @@ def test_concrete_observability_estimator_uses_nn_module_call_boundary() -> None
     assert result.features is None
 
 
-def test_observability_matrix_estimator_is_still_an_explicit_placeholder() -> None:
-    """
-    Document the current repository state without pretending the matrix estimator exists.
-
-    Replace this test with numerical batching/Fisher tests when
-    ``ObservabilityMatrixEstimator`` receives its real implementation.
-    """
-
-    estimator = ObservabilityMatrixEstimator()
-
-    # The current placeholder has historically used either the two-argument
-    # estimator boundary or the newer metadata-aware three-argument boundary.
-    # Both are implementation placeholders and must fail explicitly rather than
-    # return fabricated observability.
-    try:
-        result = estimator({}, {})
-    except TypeError:
-        with pytest.raises(NotImplementedError):
-            estimator({}, {}, {})
-    else:
-        raise AssertionError(f"Placeholder ObservabilityMatrixEstimator unexpectedly returned {result!r}.")

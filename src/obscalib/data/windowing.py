@@ -8,9 +8,10 @@ from collections.abc import Mapping
 import torch
 
 from obscalib.config import WindowingConfig
-from obscalib.data.structures import GeometryType, SensorMetadata, SensorStream, StreamWindow
+from obscalib.data.structures import GeometryType, MINIMUM_REQUIRED_SAMPLES_PER_STREAM, SensorMetadata, SensorStream, StreamWindow
 
-
+# Every required sensor must provide enough temporal support to define at least
+# one positive-duration measurement interval inside an accepted window.
 _INTERVAL_CHAIN_ATOL_SECONDS = 1e-6
 
 
@@ -203,36 +204,129 @@ def _downsample_stream(stream: SensorStream, max_samples: int, geometry_type: Ge
 
 def _extract_stream_window(stream: SensorStream, window_start_time: float, window_end_time: float, max_samples: int, geometry_type: GeometryType | None = None) -> SensorStream | None:
     """
-    Extract, cap, and time-normalize one sensor stream.
+    Extract, geometry-aware downsample, and time-normalize one sensor stream.
 
-    Point measurements use the half-open interval ``[window_start_time,
-    window_end_time)``. Interval measurements are retained only when both their
-    start and end timestamps lie inside the window.
+    Point measurements use the half-open interval
+
+        [window_start_time, window_end_time).
+
+    Relative SO3/SE3 measurements are accepted only when their complete
+    [start, end] interval lies inside the window.
+
+    A complete multi-sensor window requires at least two measurements from
+    every required stream. This prevents windows crossing sensor-data gaps from
+    entering the dataset with insufficient temporal support.
     """
 
-    if stream.interval_start_timestamps is None:
-        start_index, end_index = _window_indices(stream.timestamps, window_start_time, window_end_time)
+    ##################################################
+    # Point-valued measurements
+    ##################################################
 
-        if start_index >= end_index:
+    if stream.interval_start_timestamps is None:
+        start_index, end_index = _window_indices(
+            stream.timestamps,
+            window_start_time,
+            window_end_time,
+        )
+
+        num_samples = (
+            end_index
+            - start_index
+        )
+
+        if num_samples < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
             return None
 
-        window_stream = SensorStream(values=stream.values[start_index:end_index], timestamps=stream.timestamps[start_index:end_index], interval_start_timestamps=None)
-        window_stream = _downsample_stream(window_stream, max_samples, geometry_type)
+        window_stream = SensorStream(
+            values=stream.values[
+                start_index:end_index
+            ],
+            timestamps=stream.timestamps[
+                start_index:end_index
+            ],
+            interval_start_timestamps=None,
+        )
 
-        return SensorStream(values=window_stream.values, timestamps=window_stream.timestamps - window_start_time, interval_start_timestamps=None)
+        window_stream = _downsample_stream(
+            window_stream,
+            max_samples,
+            geometry_type,
+        )
 
-    # An interval ending exactly at the window boundary remains in this window because its start lies before that boundary and it cannot be represented completely in the following window.
-    interval_mask = (stream.interval_start_timestamps >= window_start_time) & (stream.timestamps <= window_end_time)
-    indices = torch.nonzero(interval_mask, as_tuple=False).squeeze(-1)
+        # Keep the accepted-window invariant true even if the downsampling
+        # implementation changes later.
+        if window_stream.timestamps.numel() < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
+            return None
 
-    if indices.numel() == 0:
+        return SensorStream(
+            values=window_stream.values,
+            timestamps=(
+                window_stream.timestamps
+                - window_start_time
+            ),
+            interval_start_timestamps=None,
+        )
+
+    ##################################################
+    # Interval-valued relative measurements
+    ##################################################
+
+    # A relative measurement is included only when both of its endpoints lie
+    # inside the window. An interval ending exactly at the window boundary
+    # belongs to this window because its start lies before that boundary.
+    interval_mask = (
+        (
+            stream.interval_start_timestamps
+            >= window_start_time
+        )
+        & (
+            stream.timestamps
+            <= window_end_time
+        )
+    )
+
+    indices = torch.nonzero(
+        interval_mask,
+        as_tuple=False,
+    ).squeeze(-1)
+
+    if indices.numel() < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
         return None
 
-    window_stream = SensorStream(values=stream.values[indices], timestamps=stream.timestamps[indices], interval_start_timestamps=stream.interval_start_timestamps[indices])
-    window_stream = _downsample_stream(window_stream, max_samples, geometry_type)
+    window_stream = SensorStream(
+        values=stream.values[
+            indices
+        ],
+        timestamps=stream.timestamps[
+            indices
+        ],
+        interval_start_timestamps=stream.interval_start_timestamps[
+            indices
+        ],
+    )
 
-    return SensorStream(values=window_stream.values, timestamps=window_stream.timestamps - window_start_time, interval_start_timestamps=window_stream.interval_start_timestamps - window_start_time)
+    window_stream = _downsample_stream(
+        window_stream,
+        max_samples,
+        geometry_type,
+    )
 
+    # Relative measurements also need at least two retained intervals for the
+    # current observability reference-time and trajectory construction.
+    if window_stream.timestamps.numel() < MINIMUM_REQUIRED_SAMPLES_PER_STREAM:
+        return None
+
+    return SensorStream(
+        values=window_stream.values,
+        timestamps=(
+            window_stream.timestamps
+            - window_start_time
+        ),
+        interval_start_timestamps=(
+            window_stream.interval_start_timestamps
+            - window_start_time
+        ),
+    )
 
 def build_windows(streams: Mapping[str, SensorStream], config: WindowingConfig | None = None, start_time: float | None = None, end_time: float | None = None, metadata: Mapping[str, SensorMetadata] | None = None) -> list[StreamWindow]:
     """
