@@ -6,3 +6,16 @@ build/
 dist/
 *.egg-info/
 .venv/
+
+# Data
+*.csv
+*.txt
+*.json
+*.jsonl
+*.pt
+*.png
+*.jpg
+*.jpeg
+*.npz
+*.pkl
+*.npy

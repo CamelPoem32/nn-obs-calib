@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Sequence
 
@@ -161,16 +161,25 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
         self._windows: list[WindowSample] = []
         self._window_sequence_names: list[str] = []
         self._sequence_info: list[KAISTSequenceInfo] = []
+        self._window_indices_by_sequence: dict[str, range] = {}
 
         for spec in self.sequence_specs:
             sequence_windows, sequence_info = self._load_sequence(spec)
-
+            first_window_index = len(self._windows)
+            sequence_windows = [replace(window, dataset_index=first_window_index + local_index) for local_index, window in enumerate(sequence_windows)]
             self._windows.extend(sequence_windows)
             self._window_sequence_names.extend([spec.name] * len(sequence_windows))
             self._sequence_info.append(sequence_info)
+            self._window_indices_by_sequence[spec.name] = range(first_window_index, len(self._windows))
 
         if not self._windows:
             raise ValueError("No usable windows were produced from the requested KAIST sequences.")
+
+        self._calibration_keys = tuple(self._windows[0].current_calibration)
+
+        for window in self._windows[1:]:
+            if tuple(window.current_calibration) != self._calibration_keys:
+                raise ValueError(f"All KAIST windows must use the same ordered calibration keys. Expected {self._calibration_keys}, got {tuple(window.current_calibration)}.")
 
     def __len__(self) -> int:
         return len(self._windows)
@@ -190,6 +199,20 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
         """Return the source sequence name for one materialized window."""
 
         return self._window_sequence_names[index]
+
+    @property
+    def calibration_keys(self) -> tuple[str, ...]:
+        """Return the deterministic calibration-key order used by every window."""
+
+        return self._calibration_keys
+
+    def window_indices_for_sequence(self, sequence_name: str) -> range:
+        """Return stable global dataset indices belonging to one sequence."""
+
+        if sequence_name not in self._window_indices_by_sequence:
+            raise KeyError(f"Unknown KAIST sequence {sequence_name!r}. Available sequences: {self.sequence_names}")
+
+        return self._window_indices_by_sequence[sequence_name]
 
     def estimated_tensor_bytes(self) -> int:
         """Return the approximate number of tensor bytes occupied by all materialized windows."""
@@ -361,6 +384,7 @@ def _cast_window_relative_timestamps(window: WindowSample, dtype: torch.dtype) -
         current_calibration=dict(window.current_calibration),
         metadata=dict(window.metadata),
         targets=None if window.targets is None else dict(window.targets),
+        dataset_index=window.dataset_index,
     )
 
 
@@ -411,51 +435,27 @@ class KAISTSequenceChunkDataset(Dataset[tuple[WindowSample, ...]]):
         self.sequence_length = sequence_length
         self.sequence_stride = sequence_stride
 
-        indices_by_sequence: dict[str, list[int]] = {}
-
-        for index in range(len(dataset)):
-            sequence_name = dataset.sequence_name_for_window(index)
-
-            indices_by_sequence.setdefault(
-                sequence_name,
-                [],
-            ).append(index)
-
         self._chunk_indices: list[tuple[int, ...]] = []
 
         for sequence_name in dataset.sequence_names:
-            sequence_indices = indices_by_sequence.get(
-                sequence_name,
-                [],
-            )
+            sequence_indices = dataset.window_indices_for_sequence(sequence_name)
 
-            for start_index in range(
-                0,
-                len(sequence_indices) - sequence_length + 1,
-                sequence_stride,
-            ):
-                chunk_indices = tuple(
-                    sequence_indices[
-                        start_index :
-                        start_index + sequence_length
-                    ]
-                )
+            for start_index in range(0, len(sequence_indices) - sequence_length + 1, sequence_stride):
+                self._chunk_indices.append(tuple(sequence_indices[start_index : start_index + sequence_length]))
 
-                self._chunk_indices.append(
-                    chunk_indices
-                )
-
-        if not self._chunk_indices:
-            raise ValueError("No complete sequence chunks could be constructed.")
+                if not self._chunk_indices:
+                    raise ValueError("No complete sequence chunks could be constructed.")
 
     def __len__(self) -> int:
         return len(self._chunk_indices)
 
+    def window_indices_for_chunk(self, index: int) -> tuple[int, ...]:
+        """Return stable KAISTCalibrationDataset indices for one sequence chunk."""
+
+        return self._chunk_indices[index]
+
     def __getitem__(self, index: int) -> tuple[WindowSample, ...]:
-        return tuple(
-            self.dataset[window_index]
-            for window_index in self._chunk_indices[index]
-        )
+        return tuple(self.dataset[window_index] for window_index in self._chunk_indices[index])
 
 
 def collate_kaist_sequence_chunks(samples: list[tuple[WindowSample, ...]]) -> tuple[WindowBatch, ...]:

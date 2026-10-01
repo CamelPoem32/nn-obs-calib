@@ -185,3 +185,39 @@ class WindowingConfig:
 
         return self.window_duration_s if self.window_stride_s is None else self.window_stride_s
 
+@dataclass(frozen=True)
+class ObservabilityPredictionHeadConfig:
+    """MLP configuration for one seven-coordinate observability predictor."""
+
+    hidden_dims: tuple[int, ...] = (128, 64)
+    activation: str = "gelu"
+    dropout: float = 0.1
+
+    def __post_init__(self) -> None:
+        for index, hidden_dim in enumerate(self.hidden_dims):
+            _validate_positive(f"hidden_dims[{index}]", hidden_dim)
+
+        _validate_dropout(self.dropout)
+
+
+@dataclass(frozen=True)
+class ObservabilityPredictionModelConfig:
+    """Configuration for calibration-wise observability prediction."""
+
+    transformer: TransformerConfig
+    calibration_keys: tuple[str, ...] = field(default_factory=tuple)
+    head: ObservabilityPredictionHeadConfig = field(default_factory=ObservabilityPredictionHeadConfig)
+    head_mode: str = "shared"
+
+    def __post_init__(self) -> None:
+        if not self.calibration_keys:
+            raise ValueError("At least one calibration key is required.")
+
+        if any(not isinstance(key, str) or not key for key in self.calibration_keys):
+            raise ValueError("calibration_keys must contain non-empty strings.")
+
+        if len(self.calibration_keys) != len(set(self.calibration_keys)):
+            raise ValueError("calibration_keys must be unique.")
+
+        if self.head_mode not in {"individual", "shared"}:
+            raise ValueError("head_mode must be either 'individual' or 'shared'.")

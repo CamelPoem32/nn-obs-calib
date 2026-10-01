@@ -44,13 +44,19 @@ def _make_two_stream_imu_window() -> WindowBatch:
     """Construct gyro and accelerometer streams sharing one physical IMU key."""
 
     timestamps = torch.tensor(
-        [[0.0, 2.0, 4.0, 6.0, 8.0, 10.0]],
+        [[0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12, 14, 16, 18, 20, 22]],
         dtype=DTYPE,
     )
 
     gyro_values = torch.tensor(
         [
             [
+                [1.0, 0.0, 0.0],
+                [0.9, 0.1, 0.0],
+                [0.8, 0.2, 0.1],
+                [0.7, 0.3, 0.1],
+                [0.6, 0.4, 0.2],
+                [0.5, 0.5, 0.2],
                 [1.0, 0.0, 0.0],
                 [0.9, 0.1, 0.0],
                 [0.8, 0.2, 0.1],
@@ -65,6 +71,12 @@ def _make_two_stream_imu_window() -> WindowBatch:
     accel_values = torch.tensor(
         [
             [
+                [0.0, 0.0, -9.81],
+                [0.1, 0.0, -9.80],
+                [0.1, 0.1, -9.79],
+                [0.2, 0.1, -9.78],
+                [0.2, 0.2, -9.77],
+                [0.3, 0.2, -9.76],
                 [0.0, 0.0, -9.81],
                 [0.1, 0.0, -9.80],
                 [0.1, 0.1, -9.79],

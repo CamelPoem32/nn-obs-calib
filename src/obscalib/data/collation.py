@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import torch
 
-from obscalib.calibration import CalibrationState
+from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import (
     CalibrationTarget,
     CalibrationTargetBatch,
@@ -206,6 +206,33 @@ def _validate_metadata(
 
     return dict(reference)
 
+def _collate_dataset_indices(windows: Sequence[WindowSample]) -> torch.Tensor | None:
+    '''Collect stable dataset indices without creating a separate dataset wrapper.'''
+
+    index_presence = [
+        window.dataset_index is not None
+        for window in windows
+    ]
+
+    if any(index_presence) and not all(index_presence):
+        raise ValueError("dataset_index must be present for either all or none of the windows in one minibatch.")
+
+    if not any(index_presence):
+        return None
+
+    dataset_indices = torch.tensor(
+        [
+            int(window.dataset_index)
+            for window in windows
+        ],
+        dtype=torch.long,
+    )
+
+    if torch.any(dataset_indices < 0):
+        raise ValueError("dataset_index must be nonnegative.")
+
+    return dataset_indices
+
 
 def collate_windows(
     windows: Sequence[WindowSample],
@@ -294,9 +321,17 @@ def collate_windows(
             for target_key in target_keys
         }
 
+    dataset_index_presence = [window.dataset_index is not None for window in windows]
+
+    if any(dataset_index_presence) and not all(dataset_index_presence):
+        raise ValueError("dataset_index must be present for either all or none of the windows in one minibatch.")
+
+    dataset_indices = torch.tensor([window.dataset_index for window in windows], dtype=torch.long) if all(dataset_index_presence) else None
+
     return WindowBatch(
         streams=streams,
         current_calibration=current_calibration,
         metadata=metadata,
         targets=targets,
+        dataset_indices=dataset_indices,
     )

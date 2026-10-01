@@ -742,6 +742,89 @@ class CombinedObservabilityMapper(ObservabilityMapper):
             ),
         )
 
+def dimensionless_soft_projector_observability(
+    fisher_information_matrix: torch.Tensor,
+    calibration_layout,
+    *,
+    calibration_scale: Sequence[float],
+    lambda_value_setting: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute coordinate-wise observability from a physically normalized Fisher matrix.
+
+    Let
+
+        delta_c = D delta_u,
+
+    where delta_c contains physical calibration coordinates and delta_u is
+    dimensionless. Then
+
+        F_u = D.T @ F_c @ D.
+
+    The soft projector is
+
+        P_soft = V diag(g_i) V.T,
+        g_i = lambda_i / (lambda_i + lambda_value_setting),
+
+    and the returned coordinate observability is
+
+        o = diag(P_soft).
+
+    Returns:
+        coordinate_observability:
+            [D], values in [0, 1].
+
+        soft_projector:
+            [D, D].
+
+        dimensionless_fisher:
+            [D, D].
+
+        dimensionless_eigenvalues:
+            [D].
+    """
+
+    if lambda_value_setting <= 0.0:
+        raise ValueError("lambda_value_setting must be positive.")
+
+    fisher_information_matrix = fisher_information_matrix.detach().to(device="cpu", dtype=torch.float64)
+
+    if fisher_information_matrix.ndim != 2 or fisher_information_matrix.shape[0] != fisher_information_matrix.shape[1]:
+        raise ValueError(f"Expected square Fisher matrix, got {tuple(fisher_information_matrix.shape)}.")
+
+    if fisher_information_matrix.shape[0] != calibration_layout.total_dimension:
+        raise ValueError(f"Fisher matrix dimension {fisher_information_matrix.shape[0]} does not match calibration layout dimension {calibration_layout.total_dimension}.")
+
+    calibration_scale = torch.as_tensor(tuple(float(value) for value in calibration_scale), dtype=torch.float64)
+
+    if calibration_scale.numel() == 7:
+        calibration_scale = calibration_scale.repeat(len(calibration_layout.blocks))
+    elif calibration_scale.numel() != calibration_layout.total_dimension:
+        raise ValueError(f"calibration_scale must contain either 7 values or {calibration_layout.total_dimension} values.")
+
+    if not torch.isfinite(calibration_scale).all() or torch.any(calibration_scale <= 0.0):
+        raise ValueError("calibration_scale values must be finite and positive.")
+
+    fisher_information_matrix = 0.5 * (fisher_information_matrix + fisher_information_matrix.T)
+    dimensionless_fisher = calibration_scale[:, None] * fisher_information_matrix * calibration_scale[None, :]
+    dimensionless_fisher = 0.5 * (dimensionless_fisher + dimensionless_fisher.T)
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(dimensionless_fisher)
+
+    maximum_absolute_eigenvalue = torch.max(torch.abs(eigenvalues))
+    negative_tolerance = torch.finfo(dimensionless_fisher.dtype).eps * dimensionless_fisher.shape[0] * max(float(maximum_absolute_eigenvalue), 1.0)
+
+    if torch.any(eigenvalues < -negative_tolerance):
+        raise ValueError("Dimensionless Fisher matrix has materially negative eigenvalues.")
+
+    eigenvalues = torch.clamp(eigenvalues, min=0.0)
+    soft_mode_strength = eigenvalues / (eigenvalues + float(lambda_value_setting))
+    soft_projector = (eigenvectors * soft_mode_strength.unsqueeze(0)) @ eigenvectors.T
+    coordinate_observability = torch.diagonal(soft_projector)
+    coordinate_observability = torch.clamp(coordinate_observability, min=0.0, max=1.0)
+
+    return coordinate_observability, soft_projector, dimensionless_fisher, eigenvalues
+
 
 __all__ = [
     "CRLBTanhObservabilityMapper",

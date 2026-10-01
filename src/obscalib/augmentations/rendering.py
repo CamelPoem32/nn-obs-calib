@@ -99,6 +99,7 @@ class CalibrationEventRenderer:
             current_calibration=dict(window.current_calibration),
             metadata=dict(window.metadata),
             targets=None if window.targets is None else dict(window.targets),
+            dataset_indices=window.dataset_indices,
         )
 
 

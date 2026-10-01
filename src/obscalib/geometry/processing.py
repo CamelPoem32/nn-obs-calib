@@ -567,6 +567,7 @@ class GeometryProcessor(nn.Module):
                 timestamps=corrected_timestamps,
                 sample_mask=stream.sample_mask,
                 measurement_type=stream_metadata.measurement_type,
+                calibration_key=stream_metadata.calibration_key,
             )
 
         return result

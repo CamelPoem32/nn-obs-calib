@@ -82,6 +82,7 @@ class SensorFrameRandomizer:
             current_calibration=randomized_calibration,
             metadata=dict(window.metadata),
             targets=None if window.targets is None else dict(window.targets),
+            dataset_indices=window.dataset_indices,
         )
 
         return randomized_window, randomized_calibration, frame_randomization_by_key
@@ -254,6 +255,7 @@ def _copy_window(window: WindowBatch) -> WindowBatch:
         current_calibration=dict(window.current_calibration),
         metadata=dict(window.metadata),
         targets=None if window.targets is None else dict(window.targets),
+        dataset_indices=window.dataset_indices,
     )
 
 

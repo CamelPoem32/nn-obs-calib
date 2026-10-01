@@ -229,7 +229,7 @@ class WindowStep:
         observability = self._compute_observability(window, current_calibration)
 
         canonical_streams = self.geometry_processor(window.streams, window.metadata, current_calibration)
-        tokens = self.tokenizer(canonical_streams, observability, metadata=window.metadata)
+        tokens = self.tokenizer(canonical_streams, observability)
         tokens.validate()
 
         calibration_context = self._build_calibration_context(current_calibration)

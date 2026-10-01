@@ -16,9 +16,9 @@ def _make_stream(timestamps: torch.Tensor, feature_dim: int = 1) -> SensorStream
 
 def test_build_windows_constructs_non_overlapping_windows_by_default() -> None:
     streams = {
-        "gyroscope": _make_stream(torch.arange(100.0, 111.0)),
-        "accelerometer": _make_stream(torch.arange(100.0, 111.0)),
-        "lidar": _make_stream(torch.arange(100.0, 111.0)),
+        "gyroscope": _make_stream(torch.arange(100.0, 111.0, 0.5)),
+        "accelerometer": _make_stream(torch.arange(100.0, 111.0, 0.5)),
+        "lidar": _make_stream(torch.arange(100.0, 111.0, 0.5)),
     }
 
     config = WindowingConfig(window_duration_s=5.0, max_samples_per_sensor=700)
@@ -32,12 +32,18 @@ def test_build_windows_constructs_non_overlapping_windows_by_default() -> None:
     assert windows[1].window_start_time == pytest.approx(105.0)
     assert windows[1].window_end_time == pytest.approx(110.0)
 
-    torch.testing.assert_close(windows[0].streams["gyroscope"].timestamps, torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
-    torch.testing.assert_close(windows[1].streams["gyroscope"].timestamps, torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
+    torch.testing.assert_close(
+        windows[0].streams["gyroscope"].timestamps,
+        torch.arange(0.0, 5.0, 0.5, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        windows[1].streams["gyroscope"].timestamps,
+        torch.arange(0.0, 5.0, 0.5, dtype=torch.float64),
+    )
 
 
 def test_build_windows_uses_half_open_intervals() -> None:
-    timestamps = torch.arange(0.0, 11.0)
+    timestamps = torch.arange(0.0, 10.0 + 1e-12, 0.5, dtype=torch.float64)
 
     streams = {
         "gyroscope": _make_stream(timestamps),
@@ -48,12 +54,27 @@ def test_build_windows_uses_half_open_intervals() -> None:
 
     assert len(windows) == 2
 
-    # The measurement at t=5 belongs only to the second [5, 10) window.
-    torch.testing.assert_close(windows[0].streams["gyroscope"].timestamps, torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
-    torch.testing.assert_close(windows[1].streams["gyroscope"].timestamps, torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
+    expected_relative_timestamps = torch.arange(0.0, 5.0, 0.5, dtype=torch.float64)
 
-    torch.testing.assert_close(windows[0].streams["gyroscope"].values[:, 0], torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
-    torch.testing.assert_close(windows[1].streams["gyroscope"].values[:, 0], torch.tensor([5.0, 6.0, 7.0, 8.0, 9.0], dtype=torch.float64))
+    torch.testing.assert_close(
+        windows[0].streams["gyroscope"].timestamps,
+        expected_relative_timestamps,
+    )
+
+    torch.testing.assert_close(
+        windows[1].streams["gyroscope"].timestamps,
+        expected_relative_timestamps,
+    )
+
+    torch.testing.assert_close(
+        windows[0].streams["gyroscope"].values[:, 0],
+        torch.arange(0.0, 10.0, dtype=torch.float64),
+    )
+
+    torch.testing.assert_close(
+        windows[1].streams["gyroscope"].values[:, 0],
+        torch.arange(10.0, 20.0, dtype=torch.float64),
+    )
 
 
 def test_build_windows_supports_configurable_overlap() -> None:
@@ -130,10 +151,14 @@ def test_build_windows_integer_downsampling_factor_guarantees_sample_limit() -> 
 
 
 def test_build_windows_rejects_candidate_when_any_required_sensor_is_missing() -> None:
-    dense_timestamps = torch.arange(0.0, 11.0)
+    dense_timestamps = torch.arange(0.0, 10.0 + 1e-12, 0.1, dtype=torch.float64)
 
-    # This sensor has no measurement inside [5, 6).
-    sparse_timestamps = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.0], dtype=torch.float64)
+    sparse_timestamps = torch.cat(
+        (
+            torch.arange(0.0, 5.0, 0.1, dtype=torch.float64),
+            torch.arange(6.0, 10.0 + 1e-12, 0.1, dtype=torch.float64),
+        )
+    )
 
     streams = {
         "gyroscope": _make_stream(dense_timestamps),
@@ -152,7 +177,7 @@ def test_build_windows_rejects_candidate_when_any_required_sensor_is_missing() -
 
 def test_build_windows_rejects_all_windows_when_required_stream_is_globally_empty() -> None:
     streams = {
-        "gyroscope": _make_stream(torch.arange(0.0, 11.0)),
+        "gyroscope": _make_stream(torch.arange(0.0, 11.0, 0.5)),
         "lidar": SensorStream(values=torch.empty(0, 3, dtype=torch.float64), timestamps=torch.empty(0, dtype=torch.float64)),
     }
 
@@ -163,9 +188,9 @@ def test_build_windows_rejects_all_windows_when_required_stream_is_globally_empt
 
 def test_build_windows_uses_common_sensor_time_interval() -> None:
     streams = {
-        "gyroscope": _make_stream(torch.arange(0.0, 16.0)),
-        "accelerometer": _make_stream(torch.arange(2.0, 14.0)),
-        "lidar": _make_stream(torch.arange(1.0, 15.0)),
+        "gyroscope": _make_stream(torch.arange(0.0, 16.0, 0.5)),
+        "accelerometer": _make_stream(torch.arange(2.0, 14.0, 0.5)),
+        "lidar": _make_stream(torch.arange(1.0, 15.0, 0.5)),
     }
 
     windows = build_windows(streams, WindowingConfig(window_duration_s=5.0, max_samples_per_sensor=700))
@@ -177,7 +202,7 @@ def test_build_windows_uses_common_sensor_time_interval() -> None:
 
 
 def test_build_windows_respects_explicit_start_and_end_bounds() -> None:
-    timestamps = torch.arange(0.0, 21.0)
+    timestamps = torch.arange(0.0, 21.0, 0.5)
 
     streams = {
         "gyroscope": _make_stream(timestamps),
@@ -196,7 +221,7 @@ def test_build_windows_respects_explicit_start_and_end_bounds() -> None:
 
 
 def test_build_windows_discards_incomplete_trailing_window() -> None:
-    timestamps = torch.arange(0.0, 13.0)
+    timestamps = torch.arange(0.0, 13.0, 0.5)
 
     streams = {
         "gyroscope": _make_stream(timestamps),
@@ -210,7 +235,7 @@ def test_build_windows_discards_incomplete_trailing_window() -> None:
 
 
 def test_build_windows_preserves_feature_dimensions() -> None:
-    timestamps = torch.arange(0.0, 6.0)
+    timestamps = torch.arange(0.0, 6.0, 0.5)
 
     streams = {
         "gyroscope": _make_stream(timestamps, feature_dim=3),
@@ -221,13 +246,13 @@ def test_build_windows_preserves_feature_dimensions() -> None:
     windows = build_windows(streams, WindowingConfig(window_duration_s=5.0, max_samples_per_sensor=700))
 
     assert len(windows) == 1
-    assert windows[0].streams["gyroscope"].values.shape == (5, 3)
-    assert windows[0].streams["accelerometer"].values.shape == (5, 3)
-    assert windows[0].streams["camera_pose"].values.shape == (5, 16)
+    assert windows[0].streams["gyroscope"].values.shape == (10, 3)
+    assert windows[0].streams["accelerometer"].values.shape == (10, 3)
+    assert windows[0].streams["camera_pose"].values.shape == (10, 16)
 
 
 def test_build_windows_does_not_modify_original_timestamps() -> None:
-    timestamps = torch.arange(100.0, 111.0, dtype=torch.float64)
+    timestamps = torch.arange(100.0, 111.0, 0.5, dtype=torch.float64)
 
     streams = {
         "gyroscope": _make_stream(timestamps),
@@ -251,7 +276,7 @@ def test_build_windows_rejects_unsorted_timestamps() -> None:
                 dtype=torch.float64,
             )
         ),
-        "accelerometer": _make_stream(torch.arange(0.0, 6.0)),
+        "accelerometer": _make_stream(torch.arange(0.0, 6.0, 0.5)),
     }
 
     # Accept either the older "sorted" wording or the newer, more precise
@@ -273,7 +298,7 @@ def test_build_windows_rejects_unsorted_timestamps() -> None:
 def test_build_windows_rejects_nonfinite_timestamps() -> None:
     streams = {
         "gyroscope": _make_stream(torch.tensor([0.0, 1.0, float("nan"), 3.0, 4.0, 5.0], dtype=torch.float64)),
-        "accelerometer": _make_stream(torch.arange(0.0, 6.0)),
+        "accelerometer": _make_stream(torch.arange(0.0, 6.0, 0.5)),
     }
 
     with pytest.raises(ValueError, match="must be finite"):

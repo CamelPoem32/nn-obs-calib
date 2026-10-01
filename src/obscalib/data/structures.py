@@ -378,12 +378,16 @@ class WindowSample:
 
     CalibrationState currently follows the package's batched convention, so
     states stored in a WindowSample are expected to use batch size one.
+
+    dataset_index is an optional stable index into the source dataset. It is
+    metadata only and is never presented to the learned model.
     """
 
     streams: dict[str, SensorStream]
     current_calibration: dict[str, CalibrationState]
     metadata: dict[str, SensorMetadata]
     targets: dict[str, CalibrationTarget] | None = None
+    dataset_index: int | None = None
 
 
 @dataclass
@@ -393,12 +397,16 @@ class WindowBatch:
 
     Each sensor stream is padded independently. A high-rate IMU therefore does
     not force a low-rate LiDAR stream to use the same padded sequence length.
+
+    dataset_indices identifies the source dataset windows in minibatch order.
+    It remains external metadata and is not used as a learned feature.
     """
 
     streams: dict[str, SensorStreamBatch]
     current_calibration: dict[str, CalibrationState]
     metadata: dict[str, SensorMetadata]
     targets: dict[str, CalibrationTargetBatch] | None = None
+    dataset_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -406,39 +414,25 @@ class CanonicalSensorStreamBatch:
     """
     One sensor stream after calibration-prior transformation and geometry mapping.
 
-    values:
-        Canonical vector-valued measurements with shape [B, N_s, d_s].
-
-        Examples:
-            gyro / accelerometer -> [B, N_s, 3]
-            SO(3) update         -> [B, N_s, 3]
-            SE(3) update         -> [B, N_s, 6]
-
-    timestamps:
-        Relative timestamps with shape [B, N_s].
-
-    sample_mask:
-        True for real samples and False for collation padding.
-
-    measurement_type:
-        Physical measurement type used to select the learned encoder.
+    calibration_key preserves the physical calibration association of the raw
+    stream so later tokenization may construct calibration IDs without encoding
+    them into the numerical token vector.
     """
 
     values: torch.Tensor
     timestamps: torch.Tensor
     sample_mask: torch.Tensor
     measurement_type: MeasurementType
+    calibration_key: str | None = None
 
     def validate(self) -> None:
-        """Validate the geometry-mapped padded sequence."""
+        _validate_batched_sequence_fields(self.values, self.timestamps, self.sample_mask)
 
-        _validate_batched_sequence_fields(
-            self.values,
-            self.timestamps,
-            self.sample_mask,
-        )
         if self.values.ndim != 3:
             raise ValueError("Canonical values must have shape [B, N, D].")
+
+        if self.calibration_key is not None and not self.calibration_key:
+            raise ValueError("calibration_key must be non-empty when provided.")
 
 
 @dataclass
@@ -473,27 +467,65 @@ class EncodedSensorStreamBatch:
         _validate_batched_sequence_fields(self.features, self.timestamps, self.sample_mask)
 
 
+def _validate_calibration_routing(calibration_ids: torch.Tensor | None, calibration_keys: tuple[str, ...], token_mask: torch.Tensor) -> None:
+    '''Validate token-to-calibration routing metadata.'''
+
+    if calibration_ids is None:
+        if calibration_keys:
+            raise ValueError("calibration_keys must be empty when calibration_ids is None.")
+        return
+
+    if calibration_ids.shape != token_mask.shape:
+        raise ValueError("calibration_ids must have shape [B, N].")
+
+    if calibration_ids.dtype != torch.long:
+        raise TypeError("calibration_ids must use torch.long dtype.")
+
+    if calibration_ids.device != token_mask.device:
+        raise ValueError("calibration_ids and token_mask must be on the same device.")
+
+    if not calibration_keys:
+        raise ValueError("calibration_keys must be non-empty when calibration_ids are present.")
+
+    if len(calibration_keys) != len(set(calibration_keys)):
+        raise ValueError("calibration_keys must be unique.")
+
+    valid_ids = calibration_ids[token_mask]
+
+    if valid_ids.numel() > 0:
+        if torch.any(valid_ids < 0) or torch.any(valid_ids >= len(calibration_keys)):
+            raise ValueError("Valid calibration_ids must index calibration_keys.")
+
+
+
+
+
 @dataclass
 class MeasurementSequenceBatch:
     """
     Concatenated, not necessarily time-sorted Transformer-input sequence.
 
-    x already contains the complete per-measurement feature vector
-
-        [measurement | timestamp | measurement type | optional observability].
-
-    timestamps is retained separately only so the complete x vectors can be
-    sorted chronologically after all streams have been concatenated.
+    calibration_ids is optional metadata with shape [B, N]. It is sorted using
+    exactly the same permutation as x but is not included inside x.
     """
 
     x: torch.Tensor
     timestamps: torch.Tensor
     token_mask: torch.Tensor
+    calibration_ids: torch.Tensor | None = None
 
     def validate(self) -> None:
-        """Validate the concatenated sequence."""
-
         _validate_batched_sequence_fields(self.x, self.timestamps, self.token_mask)
+
+        if self.calibration_ids is not None:
+            if self.calibration_ids.shape != self.timestamps.shape:
+                raise ValueError("calibration_ids must have shape [B, N].")
+
+            if self.calibration_ids.dtype != torch.long:
+                raise TypeError("calibration_ids must use torch.long dtype.")
+
+            if self.calibration_ids.device != self.x.device:
+                raise ValueError("calibration_ids and x must be on the same device.")
 
 
 @dataclass
@@ -504,22 +536,19 @@ class TokenBatch:
     x:
         [B, N, d_x]
 
-        with feature ordering
-
-            [measurement | relative timestamp | measurement type | observability]
-
-        where the observability block is absent when observability is disabled.
-
     token_mask:
         [B, N], True for real tokens and False for padding.
+
+    calibration_ids:
+        Optional [B, N] physical-calibration identifiers. These remain outside
+        x and are intended for calibration-wise pooling or routing.
     """
 
     x: torch.Tensor
     token_mask: torch.Tensor
+    calibration_ids: torch.Tensor | None = None
 
     def validate(self) -> None:
-        """Validate final Transformer tokens."""
-
         if self.x.ndim != 3:
             raise ValueError("x must have shape [B, N, d_x].")
 
@@ -531,3 +560,13 @@ class TokenBatch:
 
         if self.token_mask.device != self.x.device:
             raise ValueError("token_mask and x must be on the same device.")
+
+        if self.calibration_ids is not None:
+            if self.calibration_ids.shape != self.x.shape[:2]:
+                raise ValueError("calibration_ids must have shape [B, N].")
+
+            if self.calibration_ids.dtype != torch.long:
+                raise TypeError("calibration_ids must use torch.long dtype.")
+
+            if self.calibration_ids.device != self.x.device:
+                raise ValueError("calibration_ids and x must be on the same device.")

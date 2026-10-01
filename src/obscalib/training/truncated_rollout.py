@@ -90,4 +90,5 @@ def apply_fixed_frame_randomization(window: WindowBatch, frame_randomization_by_
         current_calibration=randomized_calibration,
         metadata=dict(window.metadata),
         targets=None,
+        dataset_indices=window.dataset_indices,
     )

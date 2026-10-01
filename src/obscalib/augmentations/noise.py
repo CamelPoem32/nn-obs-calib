@@ -77,6 +77,7 @@ class MeasurementNoiseAugmenter:
             current_calibration=dict(window.current_calibration),
             metadata=dict(window.metadata),
             targets=None if window.targets is None else dict(window.targets),
+            dataset_indices=window.dataset_indices,
         )
 
         return augmented_window, noise_bias_by_stream
@@ -334,6 +335,7 @@ def _copy_window(window: WindowBatch) -> WindowBatch:
         current_calibration=dict(window.current_calibration),
         metadata=dict(window.metadata),
         targets=None if window.targets is None else dict(window.targets),
+        dataset_indices=window.dataset_indices,
     )
 
 

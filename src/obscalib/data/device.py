@@ -44,6 +44,7 @@ def window_batch_to(window: WindowBatch, device: torch.device | str, *, dtype: t
         current_calibration=current_calibration,
         metadata=dict(window.metadata),
         targets=targets,
+        dataset_indices=window.dataset_indices,
     )
 
 

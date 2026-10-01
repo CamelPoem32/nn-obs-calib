@@ -1,8 +1,8 @@
-"""Assembly and chronological sorting of Transformer measurement tokens."""
+'''Assembly and chronological sorting of Transformer measurement tokens.'''
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -17,33 +17,38 @@ class Tokenizer(nn.Module):
     """
     Assemble canonical sensor streams into final Transformer tokens.
 
-    Processing order:
-
-        canonical measurement vector
-            -> zero-pad to measurement_dim
-            -> concatenate corrected relative timestamp
-            -> concatenate raw MeasurementType integer
-            -> concatenate optional window-level observability
-            -> concatenate all sensor streams
-            -> chronological sort.
+    calibration_keys=None preserves the legacy token contract. Providing an
+    ordered sequence additionally generates calibration_ids without inserting
+    those IDs into the numerical token feature vector.
     """
 
-    def __init__(self, measurement_dim: int = 6) -> None:
+    def __init__(self, measurement_dim: int = 6, calibration_keys: Sequence[str] | None = None) -> None:
         super().__init__()
 
         if measurement_dim <= 0:
             raise ValueError("measurement_dim must be positive.")
 
-        self.measurement_dim = measurement_dim
+        if calibration_keys is not None:
+            calibration_keys = tuple(calibration_keys)
 
-    def forward(self, streams: Mapping[str, CanonicalSensorStreamBatch], observability: ObservabilityResult | None = None, *, metadata: Mapping[str, SensorMetadata] | None = None) -> TokenBatch:
+            if not calibration_keys:
+                raise ValueError("calibration_keys must not be empty when provided.")
+
+            if any(not isinstance(key, str) or not key for key in calibration_keys):
+                raise ValueError("calibration_keys must contain non-empty strings.")
+
+            if len(calibration_keys) != len(set(calibration_keys)):
+                raise ValueError("calibration_keys must be unique.")
+
+        self.measurement_dim = measurement_dim
+        self.calibration_keys = calibration_keys
+        self.calibration_id_by_key = None if calibration_keys is None else {calibration_key: calibration_id for calibration_id, calibration_key in enumerate(calibration_keys)}
+
+    def forward(self, streams: Mapping[str, CanonicalSensorStreamBatch], observability: ObservabilityResult | None = None) -> TokenBatch:
         """Build and chronologically sort the complete multi-sensor token sequence."""
 
         if not streams:
             raise ValueError("At least one canonical sensor stream is required.")
-
-        if metadata is not None and set(streams) != set(metadata):
-            raise ValueError("streams and metadata must contain identical stream keys.")
 
         stream_list = list(streams.values())
 
@@ -53,44 +58,18 @@ class Tokenizer(nn.Module):
         batch_size = stream_list[0].values.shape[0]
         dtype = stream_list[0].values.dtype
         device = stream_list[0].values.device
+        observability_features = None if observability is None else observability.features
 
-        calibration_observability_features = None
+        if observability_features is not None:
+            if observability_features.ndim != 2 or observability_features.shape[0] != batch_size:
+                raise ValueError("observability.features must have shape [B, d_observability].")
 
-        if observability is not None:
-            if observability.calibration_features is None:
-                raise ValueError("Tokenizer requires observability.calibration_features when observability is enabled.")
-
-            if metadata is None:
-                raise ValueError("Tokenizer requires sensor metadata when calibration-local observability is enabled.")
-
-            required_calibration_keys = {stream_metadata.calibration_key for stream_metadata in metadata.values()}
-            missing_calibration_keys = sorted(required_calibration_keys - set(observability.calibration_features))
-
-            if missing_calibration_keys:
-                raise KeyError(f"Observability features are missing calibration keys required by sensor streams: {missing_calibration_keys}.")
-
-            calibration_observability_features = {}
-            observability_dimension = None
-
-            for calibration_key in required_calibration_keys:
-                calibration_feature = observability.calibration_features[calibration_key]
-
-                if calibration_feature.ndim != 2 or calibration_feature.shape[0] != batch_size:
-                    raise ValueError(f"Observability features for calibration {calibration_key!r} must have shape [B, d_calibration_observability].")
-
-                if not torch.isfinite(calibration_feature).all():
-                    raise ValueError(f"Observability features for calibration {calibration_key!r} must be finite.")
-
-                if observability_dimension is None:
-                    observability_dimension = calibration_feature.shape[-1]
-                elif calibration_feature.shape[-1] != observability_dimension:
-                    raise ValueError("All calibration-local observability feature blocks must have the same dimension.")
-
-                calibration_observability_features[calibration_key] = calibration_feature.to(device=device, dtype=dtype)
+            observability_features = observability_features.to(device=device, dtype=dtype)
 
         stream_token_vectors: list[torch.Tensor] = []
         stream_timestamps: list[torch.Tensor] = []
         stream_masks: list[torch.Tensor] = []
+        stream_calibration_ids: list[torch.Tensor] = []
 
         for stream_name, stream in streams.items():
             if stream.values.shape[0] != batch_size:
@@ -110,16 +89,24 @@ class Tokenizer(nn.Module):
             measurement_types = torch.full((batch_size, num_measurements, 1), float(int(stream.measurement_type)), dtype=dtype, device=device)
             token_parts = [padded_measurements, corrected_timestamps, measurement_types]
 
-            if calibration_observability_features is not None:
-                calibration_key = metadata[stream_name].calibration_key
-                observability_per_measurement = calibration_observability_features[calibration_key][:, None, :].expand(-1, num_measurements, -1)
-                token_parts.append(observability_per_measurement)
+            if observability_features is not None:
+                token_parts.append(observability_features[:, None, :].expand(-1, num_measurements, -1))
 
             stream_token_vectors.append(torch.cat(token_parts, dim=-1))
             stream_timestamps.append(stream.timestamps)
             stream_masks.append(stream.sample_mask)
 
-        unsorted_sequence = MeasurementSequenceBatch(x=torch.cat(stream_token_vectors, dim=1), timestamps=torch.cat(stream_timestamps, dim=1), token_mask=torch.cat(stream_masks, dim=1))
+            if self.calibration_id_by_key is not None:
+                if stream.calibration_key is None:
+                    raise ValueError(f"Stream {stream_name!r} has no calibration_key but calibration-aware tokenization is enabled.")
+
+                if stream.calibration_key not in self.calibration_id_by_key:
+                    raise KeyError(f"Unknown calibration key {stream.calibration_key!r} for stream {stream_name!r}. Expected one of {self.calibration_keys}.")
+
+                stream_calibration_ids.append(torch.full((batch_size, num_measurements), self.calibration_id_by_key[stream.calibration_key], dtype=torch.long, device=device))
+
+        calibration_ids = None if self.calibration_id_by_key is None else torch.cat(stream_calibration_ids, dim=1)
+        unsorted_sequence = MeasurementSequenceBatch(x=torch.cat(stream_token_vectors, dim=1), timestamps=torch.cat(stream_timestamps, dim=1), token_mask=torch.cat(stream_masks, dim=1), calibration_ids=calibration_ids)
         sorted_sequence = sort_measurement_sequence(unsorted_sequence)
 
-        return TokenBatch(x=sorted_sequence.x, token_mask=sorted_sequence.token_mask)
+        return TokenBatch(x=sorted_sequence.x, token_mask=sorted_sequence.token_mask, calibration_ids=sorted_sequence.calibration_ids)

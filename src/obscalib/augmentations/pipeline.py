@@ -77,6 +77,7 @@ class AugmentationPipeline:
             current_calibration=current_prior,
             metadata=dict(rendered_window.metadata),
             targets=augmented_targets,
+            dataset_indices=window.dataset_indices,
         )
 
         # Measurement noise is intentionally last. Frequency reduction therefore
@@ -108,7 +109,8 @@ def _copy_window_without_targets(window: WindowBatch) -> WindowBatch:
         streams=dict(window.streams),
         current_calibration=dict(window.current_calibration),
         metadata=dict(window.metadata),
-        targets=None,
+        targets=None if window.targets is None else dict(window.targets),
+        dataset_indices=window.dataset_indices,
     )
 
 

@@ -52,3 +52,11 @@ class ModelOutput:
 
     predictions: dict[str, CalibrationPrediction]
     shared_features: torch.Tensor | None = None
+
+
+@dataclass
+class ObservabilityPredictionOutput:
+    """Per-calibration seven-dimensional observability predictions and pooled latent features."""
+
+    predictions: dict[str, torch.Tensor]
+    pooled_features: dict[str, torch.Tensor]
