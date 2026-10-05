@@ -356,6 +356,38 @@ class SamplingRateAugmentationConfig:
             raise ValueError("Enabled sampling-rate augmentation requires at least one configured modality with nonzero probability.")
 
 @dataclass(frozen=True)
+class TrueCalibrationAugmentationConfig:
+    """Static ground-truth calibration diversification before prior perturbation."""
+
+    enabled: bool = False
+    probability: float = 1.0
+    probability_by_key: dict[str, float] = field(default_factory=dict)
+
+    rotation_probability: float = 1.0
+    time_offset_probability: float = 1.0
+
+    rotation: PerturbationMagnitudeConfig | None = None
+    time_offset: PerturbationMagnitudeConfig | None = None
+
+    def __post_init__(self) -> None:
+        _validate_probability("probability", self.probability)
+        _validate_probability_map("probability_by_key", self.probability_by_key)
+        _validate_probability("rotation_probability", self.rotation_probability)
+        _validate_probability("time_offset_probability", self.time_offset_probability)
+
+        if not self.enabled:
+            return
+
+        if self.rotation_probability > 0.0 and self.rotation is None:
+            raise ValueError("A positive rotation_probability requires a rotation magnitude config.")
+
+        if self.time_offset_probability > 0.0 and self.time_offset is None:
+            raise ValueError("A positive time_offset_probability requires a time-offset magnitude config.")
+
+        if self.rotation_probability <= 0.0 and self.time_offset_probability <= 0.0:
+            raise ValueError("Enabled true-calibration augmentation requires rotation or time-offset augmentation.")
+
+@dataclass(frozen=True)
 class AugmentationConfig:
     """Top-level composition of independently configurable augmentation stages."""
 
@@ -364,6 +396,7 @@ class AugmentationConfig:
     prior_perturbation: PriorPerturbationConfig = field(default_factory=PriorPerturbationConfig)
     calibration_event: CalibrationEventConfig = field(default_factory=CalibrationEventConfig)
     noise: NoiseAugmentationConfig = field(default_factory=NoiseAugmentationConfig)
+    true_calibration: TrueCalibrationAugmentationConfig = field(default_factory=TrueCalibrationAugmentationConfig)
 
 
 def _validate_probability(name: str, probability: float) -> None:

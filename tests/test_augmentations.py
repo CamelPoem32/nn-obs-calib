@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from obscalib.augmentations.calibration_event import CalibrationEventSampler
-from obscalib.augmentations.config import CalibrationEventConfig, FrameRandomizationConfig, NoiseAugmentationConfig, PerturbationDistribution, PerturbationMagnitudeConfig, PriorPerturbationConfig, SE3NoiseConfig, SO3NoiseConfig, VectorNoiseConfig
+from obscalib.augmentations.config import CalibrationEventConfig, FrameRandomizationConfig, NoiseAugmentationConfig, PerturbationDistribution, PerturbationMagnitudeConfig, PriorPerturbationConfig, SE3NoiseConfig, SO3NoiseConfig, TrueCalibrationAugmentationConfig, VectorNoiseConfig
 from obscalib.augmentations.frame_randomization import SensorFrameRandomizer
 from obscalib.augmentations.noise import MeasurementNoiseAugmenter
 from obscalib.augmentations.prior_perturbation import CalibrationPriorPerturber
@@ -17,8 +17,9 @@ from obscalib.augmentations.rendering import CalibrationEventRenderer
 from obscalib.augmentations.sampling import sample_isotropic_perturbation, sample_perturbation_magnitudes, sample_signed_scalar_perturbation, sample_uniform_so3
 from obscalib.augmentations.structures import CalibrationEvent, CalibrationTrajectory
 from obscalib.augmentations.trajectory import evaluate_calibration_trajectory
+from obscalib.augmentations.true_calibration import TrueCalibrationAugmenter
 from obscalib.calibration.state import CalibrationState
-from obscalib.data.structures import GeometryType, MeasurementType, SensorMetadata, SensorStreamBatch, WindowBatch
+from obscalib.data.structures import CalibrationTargetBatch, GeometryType, MeasurementType, SensorMetadata, SensorStreamBatch, WindowBatch
 from obscalib.geometry.lie import se3_exp, so3_exp
 from obscalib.geometry.processing import GeometryProcessor
 from obscalib.augmentations.config import SamplingRateAugmentationConfig
@@ -1430,3 +1431,205 @@ def test_sampling_rate_augmentation_disabled_preserves_window() -> None:
     assert augmented_window is window
     assert target_frequency_hz_by_stream == {}
     assert applied_by_stream == {}
+##################################################
+# Static true-calibration augmentation
+##################################################
+
+
+def test_true_calibration_augmentation_disabled_is_identity() -> None:
+    """A disabled true-calibration stage must preserve streams, truth, and targets."""
+
+    window = _make_vector_window(batch_size=2)
+    augmenter = TrueCalibrationAugmenter(TrueCalibrationAugmentationConfig())
+
+    augmented_window, true_calibration, delta_phi_by_key, delta_tau_by_key = augmenter(window, generator=torch.Generator().manual_seed(1))
+
+    torch.testing.assert_close(augmented_window.streams["gyro"].values, window.streams["gyro"].values)
+    torch.testing.assert_close(augmented_window.streams["gyro"].timestamps, window.streams["gyro"].timestamps)
+    torch.testing.assert_close(true_calibration["imu"].transform, window.current_calibration["imu"].transform)
+    torch.testing.assert_close(true_calibration["imu"].time_offset, window.current_calibration["imu"].time_offset)
+
+    assert delta_phi_by_key == {}
+    assert delta_tau_by_key == {}
+
+
+def test_true_calibration_rotation_is_left_multiplicative_and_preserves_translation() -> None:
+    """The sampled static truth rotation must left-multiply R while leaving translation untouched."""
+
+    batch_size = 8
+    old_xi = torch.tensor([0.35, -0.25, 0.18, 0.4, -0.3, 0.2], dtype=DTYPE).repeat(batch_size, 1)
+    old_state = _state_from_xi(old_xi, time_offset=0.02)
+    window = _make_vector_window(batch_size=batch_size)
+    window.current_calibration = {"imu": old_state}
+
+    maximum_rotation = math.radians(45.0)
+    augmenter = TrueCalibrationAugmenter(
+        TrueCalibrationAugmentationConfig(
+            enabled=True,
+            probability=1.0,
+            rotation_probability=1.0,
+            time_offset_probability=0.0,
+            rotation=PerturbationMagnitudeConfig(maximum=maximum_rotation),
+        )
+    )
+
+    augmented_window, true_calibration, delta_phi_by_key, delta_tau_by_key = augmenter(window, generator=torch.Generator().manual_seed(123))
+    delta_phi = delta_phi_by_key["imu"]
+    new_state = true_calibration["imu"]
+
+    expected_rotation = so3_exp(delta_phi) @ old_state.transform[..., :3, :3]
+
+    torch.testing.assert_close(new_state.transform[..., :3, :3], expected_rotation, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(new_state.transform[..., :3, 3], old_state.transform[..., :3, 3], atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(new_state.time_offset, old_state.time_offset, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(augmented_window.current_calibration["imu"].transform, new_state.transform, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(delta_tau_by_key["imu"], torch.zeros(batch_size, 1, dtype=DTYPE), atol=ATOL, rtol=RTOL)
+
+    assert torch.all(torch.linalg.vector_norm(delta_phi, dim=-1) <= maximum_rotation + 1e-12)
+    assert torch.any(torch.linalg.vector_norm(delta_phi, dim=-1) > 1e-6)
+
+    right_multiplied_rotation = old_state.transform[..., :3, :3] @ so3_exp(delta_phi)
+    assert torch.max(torch.abs(new_state.transform[..., :3, :3] - right_multiplied_rotation)).item() > 1e-5
+
+
+def test_true_calibration_vector_rendering_and_time_shift_are_physically_consistent() -> None:
+    """Changing static true rotation/tau must re-express vectors and preserve corrected physical time."""
+
+    batch_size = 4
+    timestamps = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=DTYPE).repeat(batch_size, 1)
+    values = torch.tensor([[[1.0, 2.0, -0.5], [0.2, -0.4, 1.1], [-1.0, 0.5, 0.3], [0.7, 0.8, -0.2]]], dtype=DTYPE).repeat(batch_size, 1, 1)
+
+    old_state = _state_from_xi(torch.tensor([0.25, -0.1, 0.2, 0.3, -0.2, 0.4], dtype=DTYPE).repeat(batch_size, 1), time_offset=0.015)
+
+    window = WindowBatch(
+        streams={"gyro": _make_stream(values, timestamps)},
+        current_calibration={"imu": old_state},
+        metadata={"gyro": SensorMetadata(measurement_type=MeasurementType.IMU_GYROSCOPE, geometry_type=GeometryType.VECTOR, calibration_key="imu")},
+        targets=None,
+    )
+
+    augmenter = TrueCalibrationAugmenter(
+        TrueCalibrationAugmentationConfig(
+            enabled=True,
+            probability=1.0,
+            rotation_probability=1.0,
+            time_offset_probability=1.0,
+            rotation=PerturbationMagnitudeConfig(maximum=math.radians(30.0)),
+            time_offset=PerturbationMagnitudeConfig(maximum=0.05),
+        )
+    )
+
+    augmented_window, true_calibration, _, delta_tau_by_key = augmenter(window, generator=torch.Generator().manual_seed(77))
+    new_state = true_calibration["imu"]
+    delta_tau = delta_tau_by_key["imu"]
+
+    R_old = old_state.transform[..., :3, :3]
+    R_new = new_state.transform[..., :3, :3]
+    R_old_to_new = R_old.transpose(-1, -2) @ R_new
+
+    expected_values = values @ R_old_to_new
+    expected_timestamps = timestamps - delta_tau
+
+    torch.testing.assert_close(augmented_window.streams["gyro"].values, expected_values, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(augmented_window.streams["gyro"].timestamps, expected_timestamps, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(new_state.time_offset, old_state.time_offset + delta_tau, atol=ATOL, rtol=RTOL)
+
+    old_corrected_time = timestamps + old_state.time_offset
+    new_corrected_time = augmented_window.streams["gyro"].timestamps + new_state.time_offset
+    torch.testing.assert_close(new_corrected_time, old_corrected_time, atol=ATOL, rtol=RTOL)
+
+    old_world_vectors = (R_old[:, None] @ values.unsqueeze(-1)).squeeze(-1)
+    new_world_vectors = (R_new[:, None] @ augmented_window.streams["gyro"].values.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(new_world_vectors, old_world_vectors, atol=1e-8, rtol=1e-7)
+
+
+def test_true_calibration_relative_se3_rendering_uses_conjugation_and_shifts_both_interval_times() -> None:
+    """Relative LiDAR updates must be conjugated by the static frame change and keep interval timing consistent."""
+
+    batch_size = 3
+    interval_start_timestamps = torch.tensor([[1.0, 2.0, 3.0]], dtype=DTYPE).repeat(batch_size, 1)
+    timestamps = torch.tensor([[2.0, 3.0, 4.0]], dtype=DTYPE).repeat(batch_size, 1)
+
+    relative_xi = torch.tensor([[0.05, -0.03, 0.02, 0.4, -0.1, 0.2], [-0.02, 0.04, 0.01, 0.2, 0.3, -0.1], [0.03, 0.01, -0.05, -0.2, 0.1, 0.25]], dtype=DTYPE)
+    values = se3_exp(relative_xi).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+    old_state = _state_from_xi(torch.tensor([0.2, -0.15, 0.1, 0.5, 0.2, -0.3], dtype=DTYPE).repeat(batch_size, 1), time_offset=-0.01)
+
+    window = WindowBatch(
+        streams={"lidar": _make_stream(values, timestamps, interval_start_timestamps=interval_start_timestamps)},
+        current_calibration={"lidar": old_state},
+        metadata={"lidar": SensorMetadata(measurement_type=MeasurementType.LIDAR_POSE, geometry_type=GeometryType.SE3, calibration_key="lidar")},
+        targets=None,
+    )
+
+    augmenter = TrueCalibrationAugmenter(
+        TrueCalibrationAugmentationConfig(
+            enabled=True,
+            probability=1.0,
+            rotation_probability=1.0,
+            time_offset_probability=1.0,
+            rotation=PerturbationMagnitudeConfig(maximum=math.radians(35.0)),
+            time_offset=PerturbationMagnitudeConfig(maximum=0.03),
+        )
+    )
+
+    augmented_window, true_calibration, _, delta_tau_by_key = augmenter(window, generator=torch.Generator().manual_seed(91))
+    new_state = true_calibration["lidar"]
+    delta_tau = delta_tau_by_key["lidar"]
+
+    R_old = old_state.transform[..., :3, :3]
+    R_new = new_state.transform[..., :3, :3]
+
+    A = torch.zeros_like(old_state.transform)
+    A[..., :3, :3] = R_old.transpose(-1, -2) @ R_new
+    A[..., 3, 3] = 1.0
+    A_inverse = torch.linalg.inv(A)
+
+    expected_values = A_inverse[:, None] @ values @ A[:, None]
+    expected_end_timestamps = timestamps - delta_tau
+    expected_start_timestamps = interval_start_timestamps - delta_tau
+
+    lidar = augmented_window.streams["lidar"]
+
+    torch.testing.assert_close(lidar.values, expected_values, atol=1e-8, rtol=1e-7)
+    torch.testing.assert_close(lidar.timestamps, expected_end_timestamps, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(lidar.interval_start_timestamps, expected_start_timestamps, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(lidar.timestamps + new_state.time_offset, timestamps + old_state.time_offset, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(lidar.interval_start_timestamps + new_state.time_offset, interval_start_timestamps + old_state.time_offset, atol=ATOL, rtol=RTOL)
+
+
+def test_true_calibration_augmentation_updates_static_supervision_targets() -> None:
+    """Static calibration targets must follow the newly sampled truth while event labels remain unchanged."""
+
+    batch_size = 5
+    state = _state_from_xi(torch.tensor([0.1, -0.05, 0.07, 0.3, -0.2, 0.4], dtype=DTYPE).repeat(batch_size, 1), time_offset=0.012)
+    window = _make_vector_window(batch_size=batch_size)
+    window.current_calibration = {"imu": state}
+    window.targets = {
+        "imu": CalibrationTargetBatch(
+            next_transform=state.transform.clone(),
+            next_time_offset=state.time_offset.clone(),
+            change_label=torch.zeros(batch_size, 1, dtype=DTYPE),
+            change_time=torch.zeros(batch_size, 1, dtype=DTYPE),
+        )
+    }
+
+    augmenter = TrueCalibrationAugmenter(
+        TrueCalibrationAugmentationConfig(
+            enabled=True,
+            probability=1.0,
+            rotation_probability=1.0,
+            time_offset_probability=1.0,
+            rotation=PerturbationMagnitudeConfig(maximum=math.radians(25.0)),
+            time_offset=PerturbationMagnitudeConfig(maximum=0.02),
+        )
+    )
+
+    augmented_window, true_calibration, _, _ = augmenter(window, generator=torch.Generator().manual_seed(314))
+    target = augmented_window.targets["imu"]
+    new_state = true_calibration["imu"]
+
+    torch.testing.assert_close(target.next_transform, new_state.transform, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(target.next_time_offset, new_state.time_offset, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(target.change_label, window.targets["imu"].change_label, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(target.change_time, window.targets["imu"].change_time, atol=ATOL, rtol=RTOL)

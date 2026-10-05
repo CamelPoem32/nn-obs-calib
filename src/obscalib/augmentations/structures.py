@@ -158,6 +158,9 @@ class AugmentationRecord:
     sampling_target_frequency_hz_by_stream: dict[str, torch.Tensor] = field(default_factory=dict)
     sampling_rate_applied_by_stream: dict[str, torch.Tensor] = field(default_factory=dict)
 
+    true_calibration_delta_phi_by_key: dict[str, torch.Tensor] = field(default_factory=dict)
+    true_calibration_delta_tau_by_key: dict[str, torch.Tensor] = field(default_factory=dict)    
+
     def validate(self) -> None:
         if len(self.calibration_keys) != len(set(self.calibration_keys)):
             raise ValueError("calibration_keys must be unique.")

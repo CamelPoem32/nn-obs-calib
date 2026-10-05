@@ -14,6 +14,7 @@ from obscalib.augmentations.sampling_rate import SamplingRateAugmenter
 from obscalib.augmentations.structures import AugmentationRecord, AugmentationResult, CalibrationTrajectory
 from obscalib.augmentations.targets import build_augmented_targets
 from obscalib.data.structures import WindowBatch
+from obscalib.augmentations.true_calibration import TrueCalibrationAugmenter
 
 
 class AugmentationPipeline:
@@ -27,6 +28,7 @@ class AugmentationPipeline:
         self.event_sampler = CalibrationEventSampler(config.calibration_event)
         self.event_renderer = CalibrationEventRenderer()
         self.noise_augmenter = MeasurementNoiseAugmenter(config.noise)
+        self.true_calibration_augmenter = TrueCalibrationAugmenter(config.true_calibration)
 
     def __call__(self, window: WindowBatch, generator: torch.Generator | None = None) -> AugmentationResult:
         """Apply configured augmentation stages and return augmented data, truth, and sampled metadata."""
@@ -45,6 +47,8 @@ class AugmentationPipeline:
         # Randomize the physical sensor frames before sampling calibration
         # priors or true calibration events.
         working_window, true_pre_event_calibration, frame_randomization = self.frame_randomizer(working_window, generator=generator)
+
+        working_window, true_pre_event_calibration, true_delta_phi, true_delta_tau = self.true_calibration_augmenter(working_window, generator=generator)
 
         # The model prior is independent of the true physical calibration event.
         current_prior, prior_perturbation_xi, prior_perturbation_tau = self.prior_perturber(true_pre_event_calibration, generator=generator)
@@ -89,6 +93,8 @@ class AugmentationPipeline:
             sampling_target_frequency_hz_by_stream=sampling_target_frequency_hz,
             sampling_rate_applied_by_stream=sampling_rate_applied,
             frame_randomization_by_key=frame_randomization,
+            true_calibration_delta_phi_by_key=true_delta_phi,
+            true_calibration_delta_tau_by_key=true_delta_tau,
             prior_perturbation_xi_by_key=prior_perturbation_xi,
             prior_perturbation_tau_by_key=prior_perturbation_tau,
             events_by_key=events,
