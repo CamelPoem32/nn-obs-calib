@@ -15,6 +15,7 @@ from obscalib.models.transformer_encoder import SummaryTokenTransformerEncoder
 
 class ObsCalibModel(nn.Module):
     """Transformer, shared MLP, and reusable sensor-specific heads."""
+    uses_calibration_context = True
 
     def __init__(self, config: ObsCalibModelConfig) -> None:
         super().__init__()

@@ -221,3 +221,37 @@ class ObservabilityPredictionModelConfig:
 
         if self.head_mode not in {"individual", "shared"}:
             raise ValueError("head_mode must be either 'individual' or 'shared'.")
+
+@dataclass(frozen=True)
+class CalibrationPoolerConfig:
+    n_heads: int = 8
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        _validate_positive("n_heads", self.n_heads)
+        _validate_dropout(self.dropout)
+
+
+@dataclass(frozen=True)
+class PooledCalibrationHeadConfig:
+    hidden_dims: tuple[int, ...] = (128, 64)
+    activation: str = "gelu"
+    dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        for index, width in enumerate(self.hidden_dims):
+            _validate_positive(f"hidden_dims[{index}]", width)
+
+        _validate_dropout(self.dropout)
+
+
+@dataclass(frozen=True)
+class PooledCalibrationModelConfig:
+    transformer: TransformerConfig
+    pooler: CalibrationPoolerConfig
+    mlp: MLPConfig
+    head: PooledCalibrationHeadConfig
+
+    def __post_init__(self) -> None:
+        if self.transformer.d_model % self.pooler.n_heads != 0:
+            raise ValueError("Transformer d_model must be divisible by pooler n_heads.")

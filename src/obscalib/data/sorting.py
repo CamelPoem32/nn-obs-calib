@@ -14,6 +14,12 @@ def sort_measurement_sequence(measurements: MeasurementSequenceBatch) -> Measure
     sort_keys = torch.where(measurements.token_mask, measurements.timestamps, positive_infinity)
     permutation = torch.argsort(sort_keys, dim=1, stable=True)
     feature_indices = permutation.unsqueeze(-1).expand(-1, -1, measurements.x.shape[-1])
-    calibration_ids = None if measurements.calibration_ids is None else torch.gather(measurements.calibration_ids, 1, permutation)
+    sorted_calibration_ids = None if measurements.calibration_ids is None else torch.gather(measurements.calibration_ids, 1, permutation)
 
-    return MeasurementSequenceBatch(x=torch.gather(measurements.x, 1, feature_indices), timestamps=torch.gather(measurements.timestamps, 1, permutation), token_mask=torch.gather(measurements.token_mask, 1, permutation), calibration_ids=calibration_ids)
+    return MeasurementSequenceBatch(
+        x=torch.gather(measurements.x, 1, feature_indices),
+        timestamps=torch.gather(measurements.timestamps, 1, permutation),
+        token_mask=torch.gather(measurements.token_mask, 1, permutation),
+        calibration_ids=sorted_calibration_ids,
+        calibration_keys=measurements.calibration_keys,
+    )

@@ -48,7 +48,12 @@ class CalibrationPrediction:
 
 @dataclass
 class ModelOutput:
-    """Named calibration predictions plus an optional analysis shared_features."""
+    """
+    Named calibration predictions and optional latent analysis features.
+
+    shared_features may have shape [B, D] for the legacy named-head model or
+    [B, K, D] for the pooled calibration model.
+    """
 
     predictions: dict[str, CalibrationPrediction]
     shared_features: torch.Tensor | None = None

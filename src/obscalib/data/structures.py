@@ -502,51 +502,27 @@ def _validate_calibration_routing(calibration_ids: torch.Tensor | None, calibrat
 
 @dataclass
 class MeasurementSequenceBatch:
-    """
-    Concatenated, not necessarily time-sorted Transformer-input sequence.
-
-    calibration_ids is optional metadata with shape [B, N]. It is sorted using
-    exactly the same permutation as x but is not included inside x.
-    """
+    """Concatenated, not necessarily time-sorted Transformer-input sequence."""
 
     x: torch.Tensor
     timestamps: torch.Tensor
     token_mask: torch.Tensor
     calibration_ids: torch.Tensor | None = None
+    calibration_keys: tuple[str, ...] = ()
 
     def validate(self) -> None:
         _validate_batched_sequence_fields(self.x, self.timestamps, self.token_mask)
-
-        if self.calibration_ids is not None:
-            if self.calibration_ids.shape != self.timestamps.shape:
-                raise ValueError("calibration_ids must have shape [B, N].")
-
-            if self.calibration_ids.dtype != torch.long:
-                raise TypeError("calibration_ids must use torch.long dtype.")
-
-            if self.calibration_ids.device != self.x.device:
-                raise ValueError("calibration_ids and x must be on the same device.")
+        _validate_calibration_routing(self.calibration_ids, self.calibration_keys, self.token_mask)
 
 
 @dataclass
 class TokenBatch:
-    """
-    Final Transformer token sequence.
-
-    x:
-        [B, N, d_x]
-
-    token_mask:
-        [B, N], True for real tokens and False for padding.
-
-    calibration_ids:
-        Optional [B, N] physical-calibration identifiers. These remain outside
-        x and are intended for calibration-wise pooling or routing.
-    """
+    """Final Transformer token sequence with calibration-routing metadata."""
 
     x: torch.Tensor
     token_mask: torch.Tensor
     calibration_ids: torch.Tensor | None = None
+    calibration_keys: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if self.x.ndim != 3:
@@ -561,12 +537,4 @@ class TokenBatch:
         if self.token_mask.device != self.x.device:
             raise ValueError("token_mask and x must be on the same device.")
 
-        if self.calibration_ids is not None:
-            if self.calibration_ids.shape != self.x.shape[:2]:
-                raise ValueError("calibration_ids must have shape [B, N].")
-
-            if self.calibration_ids.dtype != torch.long:
-                raise TypeError("calibration_ids must use torch.long dtype.")
-
-            if self.calibration_ids.device != self.x.device:
-                raise ValueError("calibration_ids and x must be on the same device.")
+        _validate_calibration_routing(self.calibration_ids, self.calibration_keys, self.token_mask)
