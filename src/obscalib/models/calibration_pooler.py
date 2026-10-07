@@ -26,23 +26,24 @@ class CalibrationPooler(nn.Module):
         self.d_model = d_model
         self.calibration_context_dim = calibration_context_dim
 
-        self.query = nn.Parameter(torch.empty(1, 1, d_model))
-        self.attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            d_model,
+            n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
 
         if calibration_context_dim > 0:
+            self.query = None
             self.context_encoder = nn.Sequential(
                 nn.Linear(calibration_context_dim, d_model),
                 nn.GELU(),
                 nn.Linear(d_model, d_model),
             )
-
-            # Keep the initial conditioning relatively small so the new model starts near the historical shared-query behavior.
-            nn.init.normal_(self.context_encoder[-1].weight, mean=0.0, std=0.02)
-            nn.init.zeros_(self.context_encoder[-1].bias)
         else:
+            self.query = nn.Parameter(torch.empty(1, 1, d_model))
             self.context_encoder = None
-
-        nn.init.normal_(self.query, mean=0.0, std=0.02)
+            nn.init.normal_(self.query, mean=0.0, std=0.02)
 
     def forward(self, encoded_tokens: torch.Tensor, token_mask: torch.Tensor, calibration_ids: torch.Tensor, num_calibrations: int, calibration_context: torch.Tensor | None = None) -> torch.Tensor:
         """Return pooled calibration features with shape [B, K, D]."""
@@ -88,10 +89,12 @@ class CalibrationPooler(nn.Module):
             if torch.any(calibration_mask.sum(dim=1) == 0):
                 raise ValueError(f"Every batch item must contain at least one token for calibration_id={calibration_id}.")
 
-            query = self.query.expand(batch_size, -1, -1)
-
             if self.context_encoder is not None:
-                query = query + self.context_encoder(calibration_context[:, calibration_id]).unsqueeze(1)
+                query = self.context_encoder(
+                    calibration_context[:, calibration_id]
+                ).unsqueeze(1)
+            else:
+                query = self.query.expand(batch_size, -1, -1)
 
             pooled, _ = self.attention(
                 query=query,

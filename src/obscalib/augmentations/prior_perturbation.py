@@ -114,22 +114,29 @@ class CalibrationPriorPerturber:
     and temporal perturbations are additive:
 
         tau_prior = tau_true + delta_tau_prior.
+
+    By default, every calibration key is perturbed independently, preserving
+    the original augmentation behavior.
+
+    When ``one_calibration_per_sample`` is enabled, one calibration key is
+    sampled uniformly for every batch item and only that calibration is eligible
+    for perturbation.
+
+    When ``one_rotation_axis_per_sample`` is enabled, the rotational
+    perturbation is a signed scalar applied along one randomly sampled
+    Cartesian tangent-space axis for every batch item.
     """
 
     def __init__(self, config: PriorPerturbationConfig) -> None:
         self.config = config
 
-    def __call__(
-        self,
-        calibration_truth: Mapping[str, CalibrationState],
-        generator: torch.Generator | None = None,
-    ) -> tuple[dict[str, CalibrationState], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def __call__(self, calibration_truth: Mapping[str, CalibrationState], generator: torch.Generator | None = None) -> tuple[dict[str, CalibrationState], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
-        Sample independent prior perturbations for every calibration key.
+        Sample calibration-prior perturbations.
 
         Returns:
             calibration_priors:
-                Calibration states that will be supplied to the model.
+                Calibration states supplied to the model.
 
             prior_perturbation_xi_by_key:
                 Sampled [phi, rho] spatial perturbations with shape [B, 6].
@@ -144,6 +151,23 @@ class CalibrationPriorPerturber:
         if not self.config.enabled:
             return dict(calibration_truth), {}, {}
 
+        calibration_keys = tuple(calibration_truth)
+        reference_state = calibration_truth[calibration_keys[0]]
+
+        batch_size = reference_state.transform.shape[0]
+        device = reference_state.transform.device
+
+        for calibration_key in calibration_keys[1:]:
+            state = calibration_truth[calibration_key]
+
+            if state.transform.shape[0] != batch_size:
+                raise ValueError("All calibration states must have the same batch size.")
+
+            if state.transform.device != device:
+                raise ValueError("All calibration states must be on the same device.")
+
+        calibration_selection_masks = self._sample_calibration_selection_masks(calibration_keys=calibration_keys, batch_size=batch_size, device=device, generator=generator)
+
         calibration_priors: dict[str, CalibrationState] = {}
         prior_perturbation_xi_by_key: dict[str, torch.Tensor] = {}
         prior_perturbation_tau_by_key: dict[str, torch.Tensor] = {}
@@ -151,11 +175,7 @@ class CalibrationPriorPerturber:
         for calibration_key, true_state in calibration_truth.items():
             probability = self.config.probability_by_key.get(calibration_key, self.config.probability)
 
-            prior_state, perturbation_xi, perturbation_tau = self._perturb_state(
-                true_state=true_state,
-                probability=probability,
-                generator=generator,
-            )
+            prior_state, perturbation_xi, perturbation_tau = self._perturb_state(true_state=true_state, probability=probability, calibration_selection_mask=calibration_selection_masks[calibration_key], generator=generator)
 
             calibration_priors[calibration_key] = prior_state
             prior_perturbation_xi_by_key[calibration_key] = perturbation_xi
@@ -163,79 +183,85 @@ class CalibrationPriorPerturber:
 
         return calibration_priors, prior_perturbation_xi_by_key, prior_perturbation_tau_by_key
 
-    def _perturb_state(
-        self,
-        true_state: CalibrationState,
-        probability: float,
-        generator: torch.Generator | None,
-    ) -> tuple[CalibrationState, torch.Tensor, torch.Tensor]:
+    def _sample_calibration_selection_masks(self, calibration_keys: tuple[str, ...], batch_size: int, device: torch.device, generator: torch.Generator | None) -> dict[str, torch.Tensor]:
+        """
+        Return one [B, 1] eligibility mask per calibration key.
+
+        With ordinary independent augmentation every mask is True.
+
+        With one_calibration_per_sample enabled, exactly one key is selected
+        uniformly for every batch item. The selected key is then still subject
+        to its configured Bernoulli perturbation probability.
+        """
+
+        if not self.config.one_calibration_per_sample:
+            return {calibration_key: torch.ones(batch_size, 1, dtype=torch.bool, device=device) for calibration_key in calibration_keys}
+
+        selected_calibration_ids = torch.randint(low=0, high=len(calibration_keys), size=(batch_size,), device=device, generator=generator)
+
+        return {calibration_key: (selected_calibration_ids == calibration_id).unsqueeze(-1) for calibration_id, calibration_key in enumerate(calibration_keys)}
+
+    def _perturb_state(self, true_state: CalibrationState, probability: float, calibration_selection_mask: torch.Tensor, generator: torch.Generator | None) -> tuple[CalibrationState, torch.Tensor, torch.Tensor]:
         """Perturb one batched calibration state."""
 
         batch_size = true_state.transform.shape[0]
         device = true_state.transform.device
         dtype = true_state.transform.dtype
 
-        # One Bernoulli decision controls whether the current prior is imperfect
-        # for each batch item. Configured spatial/temporal components are then
-        # all sampled for positive items.
-        perturbation_occurred = torch.rand(
-            batch_size,
-            1,
-            device=device,
-            dtype=dtype,
-            generator=generator,
-        ) < probability
+        if calibration_selection_mask.shape != (batch_size, 1):
+            raise ValueError(f"calibration_selection_mask must have shape {(batch_size, 1)}, got {tuple(calibration_selection_mask.shape)}.")
 
-        perturbation_mask = perturbation_occurred.to(dtype=dtype)
+        if calibration_selection_mask.device != device:
+            raise ValueError("calibration_selection_mask and calibration state must be on the same device.")
+
+        perturbation_occurred = torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator) < probability
+        perturbation_mask = (calibration_selection_mask & perturbation_occurred).to(dtype=dtype)
 
         delta_phi = torch.zeros(batch_size, 3, device=device, dtype=dtype)
         delta_rho = torch.zeros(batch_size, 3, device=device, dtype=dtype)
         delta_tau = torch.zeros(batch_size, 1, device=device, dtype=dtype)
 
         if self.config.rotation is not None:
-            delta_phi = sample_isotropic_perturbation(
-                config=self.config.rotation,
-                batch_size=batch_size,
-                dimension=3,
-                device=device,
-                dtype=dtype,
-                generator=generator,
-            )
+            delta_phi = self._sample_rotation_perturbation(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
             delta_phi = delta_phi * perturbation_mask
 
         if self.config.translation is not None:
-            delta_rho = sample_isotropic_perturbation(
-                config=self.config.translation,
-                batch_size=batch_size,
-                dimension=3,
-                device=device,
-                dtype=dtype,
-                generator=generator,
-            )
+            delta_rho = sample_isotropic_perturbation(config=self.config.translation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
             delta_rho = delta_rho * perturbation_mask
 
         if self.config.time_offset is not None:
-            delta_tau = sample_signed_scalar_perturbation(
-                config=self.config.time_offset,
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-                generator=generator,
-            )
+            delta_tau = sample_signed_scalar_perturbation(config=self.config.time_offset, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
             delta_tau = delta_tau * perturbation_mask
 
         perturbation_xi = torch.cat((delta_phi, delta_rho), dim=-1)
+        perturbation_transform = se3_exp(perturbation_xi)
 
-        # Route the sampled perturbation through the same deterministic helper
-        # used by paired +delta/-delta training. This keeps the historical
-        # CalibrationPriorPerturber API and perturbation convention unchanged.
-        prior_state = apply_prior_perturbation(
-            {"calibration": true_state},
-            {"calibration": perturbation_xi},
-            {"calibration": delta_tau},
-        )["calibration"]
+        prior_state = CalibrationState(transform=perturbation_transform @ true_state.transform, time_offset=true_state.time_offset + delta_tau)
+        prior_state.validate()
 
         return prior_state, perturbation_xi, delta_tau
+
+    def _sample_rotation_perturbation(self, batch_size: int, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
+        """
+        Sample either an arbitrary tangent-space rotation or one random axis.
+
+        The one-axis mode samples both the axis and signed angle independently
+        for every batch item.
+        """
+
+        if self.config.rotation is None:
+            raise RuntimeError("Rotation perturbation requested without rotation configuration.")
+
+        if not self.config.one_rotation_axis_per_sample:
+            return sample_isotropic_perturbation(config=self.config.rotation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
+
+        selected_axes = torch.randint(low=0, high=3, size=(batch_size, 1), device=device, generator=generator)
+        signed_angles = sample_signed_scalar_perturbation(config=self.config.rotation, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+
+        delta_phi = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+        delta_phi.scatter_(dim=1, index=selected_axes, src=signed_angles)
+
+        return delta_phi
 
 
 def _validate_calibration(calibration: Mapping[str, CalibrationState]) -> None:

@@ -107,6 +107,9 @@ class PriorPerturbationConfig:
     # None disables temporal prior perturbation.
     time_offset: PerturbationMagnitudeConfig | None = None
 
+    one_calibration_per_sample: bool = False
+    one_rotation_axis_per_sample: bool = False
+
     def __post_init__(self) -> None:
         _validate_probability("probability", self.probability)
         _validate_probability_map("probability_by_key", self.probability_by_key)
