@@ -156,31 +156,20 @@ def _validate_inputs(
     )
 
 
-def _validate_timestamps(
-    timestamps_s: torch.Tensor,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    """Validate window-relative timestamps used to evaluate a trajectory."""
+def _validate_timestamps(timestamps_s: torch.Tensor, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
+    """Validate arbitrary finite window-relative timestamps, including negative values introduced by temporal calibration augmentation."""
 
     if timestamps_s.ndim != 2:
         raise ValueError("timestamps_s must have shape [B, N].")
 
     if timestamps_s.shape[0] != batch_size:
-        raise ValueError("timestamps_s and calibration trajectory must share batch size.")
-
-    if not torch.is_floating_point(timestamps_s):
-        raise TypeError("timestamps_s must have floating-point dtype.")
+        raise ValueError(f"timestamps_s batch size must be {batch_size}, got {timestamps_s.shape[0]}.")
 
     if timestamps_s.device != device:
-        raise ValueError("timestamps_s and calibration trajectory must be on the same device.")
+        raise ValueError("timestamps_s and calibration tensors must be on the same device.")
 
     if timestamps_s.dtype != dtype:
-        raise TypeError("timestamps_s and calibration trajectory must have the same dtype.")
+        raise TypeError("timestamps_s and calibration tensors must have the same dtype.")
 
     if not torch.all(torch.isfinite(timestamps_s)):
         raise ValueError("timestamps_s must contain only finite values.")
-
-    if torch.any(timestamps_s < 0.0):
-        raise ValueError("timestamps_s must be nonnegative because they are relative to the window start.")

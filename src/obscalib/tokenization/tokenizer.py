@@ -41,10 +41,10 @@ class Tokenizer(nn.Module):
                 raise ValueError("calibration_keys must be unique.")
 
         self.measurement_dim = measurement_dim
-        self.calibration_keys = calibration_keys
-        self.calibration_id_by_key = None if calibration_keys is None else {calibration_key: calibration_id for calibration_id, calibration_key in enumerate(calibration_keys)}
+        self.calibration_keys = None if calibration_keys is None else tuple(calibration_keys)
 
-    def forward(self, streams: Mapping[str, CanonicalSensorStreamBatch], observability: ObservabilityResult | None = None) -> TokenBatch:
+    def forward(self, streams: Mapping[str, CanonicalSensorStreamBatch], observability: ObservabilityResult | None = None,
+                calibration_keys: Sequence[str] | None = None,) -> TokenBatch:
         """Build and chronologically sort the complete multi-sensor token sequence."""
 
         if not streams:
@@ -59,6 +59,7 @@ class Tokenizer(nn.Module):
         dtype = stream_list[0].values.dtype
         device = stream_list[0].values.device
         observability_features = None if observability is None else observability.features
+        resolved_calibration_keys = tuple(calibration_keys) if calibration_keys is not None else self.calibration_keys
 
         if observability_features is not None:
             if observability_features.ndim != 2 or observability_features.shape[0] != batch_size:
@@ -96,17 +97,29 @@ class Tokenizer(nn.Module):
             stream_timestamps.append(stream.timestamps)
             stream_masks.append(stream.sample_mask)
 
-            if self.calibration_id_by_key is not None:
+            if resolved_calibration_keys is not None:
                 if stream.calibration_key is None:
                     raise ValueError(f"Stream {stream_name!r} has no calibration_key but calibration-aware tokenization is enabled.")
 
-                if stream.calibration_key not in self.calibration_id_by_key:
-                    raise KeyError(f"Unknown calibration key {stream.calibration_key!r} for stream {stream_name!r}. Expected one of {self.calibration_keys}.")
+                if stream.calibration_key not in resolved_calibration_keys:
+                    raise KeyError(f"Unknown calibration key {stream.calibration_key!r} for stream {stream_name!r}. Expected one of {resolved_calibration_keys}.")
 
-                stream_calibration_ids.append(torch.full((batch_size, num_measurements), self.calibration_id_by_key[stream.calibration_key], dtype=torch.long, device=device))
+                calibration_id = resolved_calibration_keys.index(stream.calibration_key)
+                stream_calibration_ids.append(torch.full((batch_size, num_measurements), calibration_id, dtype=torch.long, device=device))
 
-        calibration_ids = None if self.calibration_id_by_key is None else torch.cat(stream_calibration_ids, dim=1)
-        unsorted_sequence = MeasurementSequenceBatch(x=torch.cat(stream_token_vectors, dim=1), timestamps=torch.cat(stream_timestamps, dim=1), token_mask=torch.cat(stream_masks, dim=1), calibration_ids=calibration_ids)
+        calibration_ids = None if resolved_calibration_keys is None else torch.cat(stream_calibration_ids, dim=1)
+        unsorted_sequence = MeasurementSequenceBatch(
+            x=torch.cat(stream_token_vectors, dim=1),
+            timestamps=torch.cat(stream_timestamps, dim=1),
+            token_mask=torch.cat(stream_masks, dim=1),
+            calibration_ids=calibration_ids,
+            calibration_keys=() if resolved_calibration_keys is None else resolved_calibration_keys,
+        )
         sorted_sequence = sort_measurement_sequence(unsorted_sequence)
 
-        return TokenBatch(x=sorted_sequence.x, token_mask=sorted_sequence.token_mask, calibration_ids=sorted_sequence.calibration_ids)
+        return TokenBatch(
+            x=sorted_sequence.x,
+            token_mask=sorted_sequence.token_mask,
+            calibration_ids=sorted_sequence.calibration_ids,
+            calibration_keys=sorted_sequence.calibration_keys,
+        )

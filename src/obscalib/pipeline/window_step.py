@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -182,21 +182,25 @@ class WindowStep:
 
         return _map_batched_observability(raw_result, self.observability_mapper)
 
-    def _build_calibration_context(self, calibration: Mapping[str, CalibrationState]) -> dict[str, torch.Tensor]:
-        """
-        Build ``[phi, rho, tau]`` contexts for every configured model head.
-        """
+    def _build_calibration_context(self, calibration: Mapping[str, CalibrationState], calibration_keys: Sequence[str] | None = None) -> dict[str, torch.Tensor]:
+        """Build ``[phi, rho, tau]`` contexts for every requested calibration key."""
 
-        head_keys = tuple(self.model.heads.keys())
-        missing = sorted(set(head_keys) - set(calibration))
+        if calibration_keys is None:
+            model_heads = getattr(self.model, "heads", None)
+
+            if model_heads is None:
+                raise ValueError("calibration_keys must be provided for models without a sensor-specific heads mapping.")
+
+            calibration_keys = tuple(model_heads.keys())
+        else:
+            calibration_keys = tuple(calibration_keys)
+
+        missing = sorted(set(calibration_keys) - set(calibration))
 
         if missing:
-            raise KeyError(f"Calibration mapping is missing states required by model heads: {missing}.")
+            raise KeyError(f"Calibration mapping is missing states required by the model: {missing}.")
 
-        return {
-            head_key: calibration_state_to_context(calibration[head_key])
-            for head_key in head_keys
-        }
+        return {calibration_key: calibration_state_to_context(calibration[calibration_key]) for calibration_key in calibration_keys}
 
     def _update_calibration(self, calibration: Mapping[str, CalibrationState], model_output: ModelOutput) -> dict[str, CalibrationState]:
         """
@@ -232,8 +236,12 @@ class WindowStep:
         tokens = self.tokenizer(canonical_streams, observability)
         tokens.validate()
 
-        calibration_context = self._build_calibration_context(current_calibration)
-        model_output = self.model(tokens, calibration_context)
+        if getattr(self.model, "uses_calibration_context", True):
+            calibration_keys = tuple(tokens.calibration_keys) if tokens.calibration_keys else None
+            calibration_context = self._build_calibration_context(current_calibration, calibration_keys=calibration_keys)
+            model_output = self.model(tokens, calibration_context)
+        else:
+            model_output = self.model(tokens)
         next_calibration = self._update_calibration(current_calibration, model_output)
 
         return WindowStepResult(

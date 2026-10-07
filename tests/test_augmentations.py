@@ -1633,3 +1633,32 @@ def test_true_calibration_augmentation_updates_static_supervision_targets() -> N
     torch.testing.assert_close(target.next_time_offset, new_state.time_offset, atol=ATOL, rtol=RTOL)
     torch.testing.assert_close(target.change_label, window.targets["imu"].change_label, atol=ATOL, rtol=RTOL)
     torch.testing.assert_close(target.change_time, window.targets["imu"].change_time, atol=ATOL, rtol=RTOL)
+
+
+def test_calibration_trajectory_accepts_negative_relative_timestamps() -> None:
+    """Synthetic temporal calibration may move measured timestamps slightly before the nominal window origin."""
+
+    pre_event = _identity_state()
+
+    event = _make_event(
+        delta_xi=torch.zeros(6, dtype=DTYPE),
+        delta_tau=torch.zeros(1, dtype=DTYPE),
+        change_time_s=1.0,
+        profile=TransitionProfile.STEP,
+    )
+
+    timestamps = torch.tensor(
+        [[-0.03, 0.0, 0.5, 1.0]],
+        dtype=DTYPE,
+    )
+
+    transforms, time_offsets = evaluate_calibration_trajectory(
+        pre_event=pre_event,
+        event=event,
+        timestamps_s=timestamps,
+    )
+
+    assert transforms.shape == (1, 4, 4, 4)
+    assert time_offsets.shape == (1, 4, 1)
+    assert torch.all(torch.isfinite(transforms))
+    assert torch.all(torch.isfinite(time_offsets))

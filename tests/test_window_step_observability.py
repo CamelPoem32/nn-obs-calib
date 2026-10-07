@@ -17,6 +17,8 @@ from obscalib.observability.timebase import ReferenceTimebase
 from obscalib.pipeline.window_step import WindowStep
 from obscalib.tokenization.tokenizer import Tokenizer
 
+from obscalib.calibration import CalibrationUpdater
+from obscalib.geometry.processing import GeometryProcessor
 
 DTYPE = torch.float64
 
@@ -230,3 +232,37 @@ def test_window_step_requires_estimator_and_mapper_as_a_pair() -> None:
         assert "either both be provided or both be None" in str(error)
     else:
         raise AssertionError("WindowStep accepted an estimator without a mapper.")
+    
+def test_window_step_does_not_build_context_for_context_free_model() -> None:
+    class ContextFreeModel(nn.Module):
+        uses_calibration_context = False
+
+        def forward(self, tokens):
+            assert tokens.calibration_ids is not None
+
+            batch_size = tokens.x.shape[0]
+
+            prediction = CalibrationPrediction(
+                change_event_logit=torch.zeros(batch_size, 1, dtype=tokens.x.dtype),
+                change_time=torch.zeros(batch_size, 1, dtype=tokens.x.dtype),
+                delta_xi=torch.zeros(batch_size, 6, dtype=tokens.x.dtype),
+                delta_tau=torch.zeros(batch_size, 1, dtype=tokens.x.dtype),
+            )
+
+            return ModelOutput(
+                predictions={"imu": prediction},
+                shared_features=None,
+            )
+
+    model = ContextFreeModel()
+
+    step = WindowStep(
+        geometry_processor=GeometryProcessor(),
+        tokenizer=Tokenizer(measurement_dim=6, calibration_keys=("imu",)),
+        model=model,
+        calibration_updater=CalibrationUpdater(),
+    )
+
+    result = step(_window())
+
+    assert "imu" in result.model_output.predictions

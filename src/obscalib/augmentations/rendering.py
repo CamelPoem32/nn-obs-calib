@@ -18,6 +18,10 @@ class CalibrationEventRenderer:
     The input raw window is assumed to be physically consistent with each
     calibration trajectory's pre-event state.
 
+    Timestamps are expressed relative to the nominal window origin. Synthetic
+    temporal-calibration augmentation may therefore produce valid negative measured
+    timestamps near the beginning of a window.
+
     A time-varying calibration trajectory
 
         T_WS(t)
@@ -309,11 +313,13 @@ def _validate_window_and_truth(
                 "must have the same dtype."
             )
 
-        if torch.any(
-            stream.sample_mask
-            & (stream.timestamps < 0.0)
-        ):
-            raise ValueError(
-                f"Valid timestamps in stream {stream_key!r} must be "
-                "nonnegative and relative to the window start."
-            )
+        valid_timestamps = stream.timestamps[stream.sample_mask]
+
+        if not torch.all(torch.isfinite(valid_timestamps)):
+            raise ValueError(f"Valid timestamps in stream {stream_key!r} must be finite.")
+
+        if stream.interval_start_timestamps is not None:
+            valid_interval_start_timestamps = stream.interval_start_timestamps[stream.sample_mask]
+
+            if not torch.all(torch.isfinite(valid_interval_start_timestamps)):
+                raise ValueError(f"Valid interval start timestamps in stream {stream_key!r} must be finite.")
