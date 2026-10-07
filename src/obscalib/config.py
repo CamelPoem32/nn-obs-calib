@@ -10,6 +10,11 @@ def _validate_positive(name: str, value: int) -> None:
         raise ValueError(f"{name} must be positive, got {value}.")
 
 
+def _validate_nonnegative(name: str, value: int) -> None:
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative, got {value}.")
+
+
 def _validate_dropout(dropout: float) -> None:
     if not 0.0 <= dropout < 1.0:
         raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
@@ -29,19 +34,15 @@ class TransformerConfig:
     activation: str = "gelu"
 
     def __post_init__(self) -> None:
-        for name in (
-            "input_dim",
-            "d_model",
-            "n_heads",
-            "num_layers",
-            "dim_feedforward",
-            "num_summary_tokens",
-        ):
+        for name in ("input_dim", "d_model", "n_heads", "num_layers", "dim_feedforward", "num_summary_tokens"):
             _validate_positive(name, getattr(self, name))
+
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads.")
+
         if self.activation not in {"relu", "gelu"}:
             raise ValueError("Transformer activation must be 'relu' or 'gelu'.")
+
         _validate_dropout(self.dropout)
 
 
@@ -56,8 +57,10 @@ class MLPConfig:
 
     def __post_init__(self) -> None:
         _validate_positive("output_dim", self.output_dim)
+
         for index, width in enumerate(self.hidden_dims):
             _validate_positive(f"hidden_dims[{index}]", width)
+
         _validate_dropout(self.dropout)
 
 
@@ -72,8 +75,10 @@ class CalibrationHeadConfig:
 
     def __post_init__(self) -> None:
         _validate_positive("calibration_context_dim", self.calibration_context_dim)
+
         for index, width in enumerate(self.hidden_dims):
             _validate_positive(f"hidden_dims[{index}]", width)
+
         _validate_dropout(self.dropout)
 
 
@@ -89,14 +94,7 @@ class LossWeights:
     lambda_consistency: float = 0.0
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("lambda_rotation", self.lambda_rotation),
-            ("lambda_translation", self.lambda_translation),
-            ("lambda_time_offset", self.lambda_time_offset),
-            ("lambda_change_event", self.lambda_change_event),
-            ("lambda_change_time", self.lambda_change_time),
-            ("lambda_consistency", self.lambda_consistency),
-        ):
+        for name, value in (("lambda_rotation", self.lambda_rotation), ("lambda_translation", self.lambda_translation), ("lambda_time_offset", self.lambda_time_offset), ("lambda_change_event", self.lambda_change_event), ("lambda_change_time", self.lambda_change_time), ("lambda_consistency", self.lambda_consistency)):
             if value < 0.0:
                 raise ValueError(f"{name} must be nonnegative, got {value}.")
 
@@ -137,6 +135,7 @@ class ObsCalibModelConfig:
     def __post_init__(self) -> None:
         if not self.head_keys:
             raise ValueError("At least one calibration head key is required.")
+
         if len(set(self.head_keys)) != len(self.head_keys):
             raise ValueError("Calibration head keys must be unique.")
 
@@ -152,6 +151,7 @@ class ObsCalibModelConfig:
 
         return self.mlp.output_dim
 
+
 @dataclass(frozen=True)
 class MeasurementEncoderConfig:
     """Configuration for sensor-type-specific measurement projections."""
@@ -160,6 +160,7 @@ class MeasurementEncoderConfig:
 
     def __post_init__(self) -> None:
         _validate_positive("d_measurement", self.d_measurement)
+
 
 @dataclass(frozen=True)
 class WindowingConfig:
@@ -184,6 +185,7 @@ class WindowingConfig:
         """Use non-overlapping windows when no explicit stride is configured."""
 
         return self.window_duration_s if self.window_stride_s is None else self.window_stride_s
+
 
 @dataclass(frozen=True)
 class ObservabilityPredictionHeadConfig:
@@ -222,23 +224,33 @@ class ObservabilityPredictionModelConfig:
         if self.head_mode not in {"individual", "shared"}:
             raise ValueError("head_mode must be either 'individual' or 'shared'.")
 
+
 @dataclass(frozen=True)
 class CalibrationPoolerConfig:
+    """Configuration for shared calibration-wise attention pooling."""
+
     n_heads: int = 8
     dropout: float = 0.0
+    calibration_context_dim: int = 0
 
     def __post_init__(self) -> None:
         _validate_positive("n_heads", self.n_heads)
+        _validate_nonnegative("calibration_context_dim", self.calibration_context_dim)
         _validate_dropout(self.dropout)
 
 
 @dataclass(frozen=True)
 class PooledCalibrationHeadConfig:
+    """Configuration for the shared calibration prediction head."""
+
+    calibration_context_dim: int = 0
     hidden_dims: tuple[int, ...] = (128, 64)
     activation: str = "gelu"
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
+        _validate_nonnegative("calibration_context_dim", self.calibration_context_dim)
+
         for index, width in enumerate(self.hidden_dims):
             _validate_positive(f"hidden_dims[{index}]", width)
 
@@ -247,6 +259,8 @@ class PooledCalibrationHeadConfig:
 
 @dataclass(frozen=True)
 class PooledCalibrationModelConfig:
+    """Configuration for global encoding, calibration-wise pooling, and shared prediction."""
+
     transformer: TransformerConfig
     pooler: CalibrationPoolerConfig
     mlp: MLPConfig
@@ -255,3 +269,8 @@ class PooledCalibrationModelConfig:
     def __post_init__(self) -> None:
         if self.transformer.d_model % self.pooler.n_heads != 0:
             raise ValueError("Transformer d_model must be divisible by pooler n_heads.")
+
+        active_context_dims = {dim for dim in (self.pooler.calibration_context_dim, self.head.calibration_context_dim) if dim > 0}
+
+        if len(active_context_dims) > 1:
+            raise ValueError("Pooler and head calibration_context_dim must match when both use calibration context.")

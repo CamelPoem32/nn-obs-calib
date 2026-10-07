@@ -73,6 +73,7 @@ class TrueCalibrationAugmenter:
 
             delta_phi = torch.zeros(batch_size, 3, device=device, dtype=dtype)
             delta_tau = torch.zeros(batch_size, 1, device=device, dtype=dtype)
+            delta_translation = torch.zeros(batch_size, 3, device=device, dtype=dtype)
 
             if self.config.rotation is not None and self.config.rotation_probability > 0.0:
                 _require_uniform_distribution(self.config.rotation, "rotation")
@@ -86,15 +87,22 @@ class TrueCalibrationAugmenter:
                 sampled_tau = _sample_signed_scalar(batch_size, self.config.time_offset.maximum, device=device, dtype=dtype, generator=generator)
                 delta_tau = torch.where(time_active[:, None], sampled_tau, delta_tau)
 
+            if self.config.translation is not None and self.config.translation_probability > 0.0:
+                _require_uniform_distribution(self.config.translation, "translation")
+                translation_active = active & _sample_mask(batch_size, self.config.translation_probability, device=device, generator=generator)
+                sampled_translation = _sample_translation_vectors(batch_size, self.config.translation.maximum, device=device, dtype=dtype, generator=generator)
+                delta_translation = torch.where(translation_active[:, None], sampled_translation, delta_translation)
+                
             old_transform = state.transform
             new_transform = old_transform.clone()
             new_transform[..., :3, :3] = so3_exp(delta_phi) @ old_transform[..., :3, :3]
+            new_transform[..., :3, 3] = old_transform[..., :3, 3] + delta_translation
             new_time_offset = state.time_offset + delta_tau
 
             true_calibration[calibration_key] = CalibrationState(transform=new_transform, time_offset=new_time_offset)
             delta_phi_by_key[calibration_key] = delta_phi
             delta_tau_by_key[calibration_key] = delta_tau
-            relative_frame_by_key[calibration_key] = _rotation_only_relative_frame(old_transform, new_transform)
+            relative_frame_by_key[calibration_key] = _relative_frame(old_transform, new_transform)
 
         augmented_streams = {
             stream_key: _render_static_truth_change(
@@ -144,7 +152,7 @@ def _reexpress_measurements(measurements: torch.Tensor, geometry_type: GeometryT
         if measurements.ndim != 4 or measurements.shape[-2:] != (4, 4):
             raise ValueError("SE3 measurements must have shape [B, N, 4, 4].")
         A = relative_frame[:, None]
-        A_inverse = _inverse_rotation_only_se3(relative_frame)[:, None]
+        A_inverse = _inverse_se3(relative_frame)[:, None]
         return A_inverse @ measurements @ A
 
     raise ValueError(f"Unsupported geometry type: {geometry_type!r}.")
@@ -252,3 +260,33 @@ def _validate_window(window: WindowBatch) -> None:
 def _validate_generator(generator: torch.Generator | None) -> None:
     if generator is not None and not isinstance(generator, torch.Generator):
         raise TypeError("generator must be a torch.Generator or None.")
+
+def _sample_translation_vectors(batch_size: int, maximum: float, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
+    direction = torch.randn(batch_size, 3, device=device, dtype=dtype, generator=generator)
+    direction_norm = torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+
+    fallback = torch.zeros_like(direction)
+    fallback[:, 0] = 1.0
+
+    direction = torch.where(direction_norm > 1e-12, direction / direction_norm.clamp_min(1e-12), fallback)
+    magnitude = torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator) * maximum
+
+    return direction * magnitude
+
+def _relative_frame(old_transform: torch.Tensor, new_transform: torch.Tensor) -> torch.Tensor:
+    return _inverse_se3(old_transform) @ new_transform
+
+
+def _inverse_se3(transform: torch.Tensor) -> torch.Tensor:
+    rotation = transform[..., :3, :3]
+    translation = transform[..., :3, 3]
+
+    rotation_inverse = rotation.transpose(-1, -2)
+    translation_inverse = -(rotation_inverse @ translation.unsqueeze(-1)).squeeze(-1)
+
+    inverse = torch.zeros_like(transform)
+    inverse[..., :3, :3] = rotation_inverse
+    inverse[..., :3, 3] = translation_inverse
+    inverse[..., 3, 3] = 1.0
+
+    return inverse

@@ -456,3 +456,33 @@ def _validate_typed_noise_map(name: str, values: dict[MeasurementType, object], 
 
         if not isinstance(config, expected_type):
             raise TypeError(f"{name} values must be {expected_type.__name__} instances.")
+
+@dataclass(frozen=True)
+class TrueCalibrationAugmentationConfig:
+    enabled: bool = False
+    probability: float = 1.0
+    probability_by_key: dict[str, float] = field(default_factory=dict)
+
+    rotation_probability: float = 1.0
+    translation_probability: float = 0.0
+    time_offset_probability: float = 1.0
+
+    rotation: PerturbationMagnitudeConfig | None = None
+    translation: PerturbationMagnitudeConfig | None = None
+    time_offset: PerturbationMagnitudeConfig | None = None
+
+    def __post_init__(self) -> None:
+        _validate_probability("probability", self.probability)
+        _validate_probability_map("probability_by_key", self.probability_by_key)
+        _validate_probability("rotation_probability", self.rotation_probability)
+        _validate_probability("translation_probability", self.translation_probability)
+        _validate_probability("time_offset_probability", self.time_offset_probability)
+
+        if self.rotation_probability > 0.0 and self.rotation is None and self.enabled:
+            raise ValueError("A positive rotation_probability requires a rotation magnitude config.")
+
+        if self.translation_probability > 0.0 and self.translation is None and self.enabled:
+            raise ValueError("A positive translation_probability requires a translation magnitude config.")
+
+        if self.time_offset_probability > 0.0 and self.time_offset is None and self.enabled:
+            raise ValueError("A positive time_offset_probability requires a time-offset magnitude config.")

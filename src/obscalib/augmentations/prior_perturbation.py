@@ -12,6 +12,94 @@ from obscalib.calibration.state import CalibrationState
 from obscalib.geometry.lie import se3_exp
 
 
+def apply_prior_perturbation(
+    calibration_truth: Mapping[str, CalibrationState],
+    delta_xi_by_key: Mapping[str, torch.Tensor],
+    delta_tau_by_key: Mapping[str, torch.Tensor],
+) -> dict[str, CalibrationState]:
+    """
+    Apply explicit left calibration-prior perturbations.
+
+    The convention is
+
+        T_prior = Exp(delta_xi) @ T_true
+        tau_prior = tau_true + delta_tau
+
+    This is the same convention used by CalibrationPriorPerturber.
+    """
+
+    _validate_calibration(calibration_truth)
+
+    calibration_keys = set(calibration_truth)
+
+    if set(delta_xi_by_key) != calibration_keys:
+        raise KeyError(
+            "delta_xi_by_key must contain exactly the calibration-truth keys. "
+            f"Expected {sorted(calibration_keys)}, got {sorted(delta_xi_by_key)}."
+        )
+
+    if set(delta_tau_by_key) != calibration_keys:
+        raise KeyError(
+            "delta_tau_by_key must contain exactly the calibration-truth keys. "
+            f"Expected {sorted(calibration_keys)}, got {sorted(delta_tau_by_key)}."
+        )
+
+    perturbed_calibration = {}
+
+    for calibration_key, true_state in calibration_truth.items():
+        true_state.validate()
+
+        delta_xi = delta_xi_by_key[calibration_key]
+        delta_tau = delta_tau_by_key[calibration_key]
+
+        batch_size = true_state.transform.shape[0]
+
+        if delta_xi.shape != (batch_size, 6):
+            raise ValueError(
+                f"delta_xi_by_key[{calibration_key!r}] must have shape "
+                f"{(batch_size, 6)}, got {tuple(delta_xi.shape)}."
+            )
+
+        if delta_tau.shape != (batch_size, 1):
+            raise ValueError(
+                f"delta_tau_by_key[{calibration_key!r}] must have shape "
+                f"{(batch_size, 1)}, got {tuple(delta_tau.shape)}."
+            )
+
+        if delta_xi.device != true_state.transform.device:
+            raise ValueError(
+                f"delta_xi_by_key[{calibration_key!r}] and calibration transform "
+                "must be on the same device."
+            )
+
+        if delta_tau.device != true_state.time_offset.device:
+            raise ValueError(
+                f"delta_tau_by_key[{calibration_key!r}] and calibration time offset "
+                "must be on the same device."
+            )
+
+        if delta_xi.dtype != true_state.transform.dtype:
+            raise ValueError(
+                f"delta_xi_by_key[{calibration_key!r}] and calibration transform "
+                "must have the same dtype."
+            )
+
+        if delta_tau.dtype != true_state.time_offset.dtype:
+            raise ValueError(
+                f"delta_tau_by_key[{calibration_key!r}] and calibration time offset "
+                "must have the same dtype."
+            )
+
+        perturbed_calibration[calibration_key] = CalibrationState(
+            transform=se3_exp(delta_xi) @ true_state.transform,
+            time_offset=true_state.time_offset + delta_tau,
+        )
+
+        perturbed_calibration[calibration_key].validate()
+
+    return perturbed_calibration
+
+
 class CalibrationPriorPerturber:
     """
     Perturb the calibration state supplied to the model.
@@ -137,12 +225,15 @@ class CalibrationPriorPerturber:
             delta_tau = delta_tau * perturbation_mask
 
         perturbation_xi = torch.cat((delta_phi, delta_rho), dim=-1)
-        perturbation_transform = se3_exp(perturbation_xi)
 
-        prior_state = CalibrationState(
-            transform=perturbation_transform @ true_state.transform,
-            time_offset=true_state.time_offset + delta_tau,
-        )
+        # Route the sampled perturbation through the same deterministic helper
+        # used by paired +delta/-delta training. This keeps the historical
+        # CalibrationPriorPerturber API and perturbation convention unchanged.
+        prior_state = apply_prior_perturbation(
+            {"calibration": true_state},
+            {"calibration": perturbation_xi},
+            {"calibration": delta_tau},
+        )["calibration"]
 
         return prior_state, perturbation_xi, delta_tau
 
