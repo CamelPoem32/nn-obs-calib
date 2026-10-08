@@ -125,6 +125,11 @@ class CalibrationPriorPerturber:
     When ``one_rotation_axis_per_sample`` is enabled, the rotational
     perturbation is a signed scalar applied along one randomly sampled
     Cartesian tangent-space axis for every batch item.
+
+    When ``one_perturbation_type_per_sample`` is enabled, exactly one configured
+    perturbation type is sampled uniformly for every batch item. For example,
+    with rotation and time offset configured, each item receives either a spatial
+    rotation perturbation or a temporal perturbation, but never both.
     """
 
     def __init__(self, config: PriorPerturbationConfig) -> None:
@@ -168,6 +173,11 @@ class CalibrationPriorPerturber:
 
         calibration_selection_masks = self._sample_calibration_selection_masks(calibration_keys=calibration_keys, batch_size=batch_size, device=device, generator=generator)
 
+        perturbation_type_masks = self._sample_perturbation_type_masks(
+            batch_size=batch_size,
+            device=device,
+            generator=generator,
+        )
         calibration_priors: dict[str, CalibrationState] = {}
         prior_perturbation_xi_by_key: dict[str, torch.Tensor] = {}
         prior_perturbation_tau_by_key: dict[str, torch.Tensor] = {}
@@ -175,7 +185,13 @@ class CalibrationPriorPerturber:
         for calibration_key, true_state in calibration_truth.items():
             probability = self.config.probability_by_key.get(calibration_key, self.config.probability)
 
-            prior_state, perturbation_xi, perturbation_tau = self._perturb_state(true_state=true_state, probability=probability, calibration_selection_mask=calibration_selection_masks[calibration_key], generator=generator)
+            prior_state, perturbation_xi, perturbation_tau = self._perturb_state(
+                true_state=true_state,
+                probability=probability,
+                calibration_selection_mask=calibration_selection_masks[calibration_key],
+                perturbation_type_masks=perturbation_type_masks,
+                generator=generator,
+            )
 
             calibration_priors[calibration_key] = prior_state
             prior_perturbation_xi_by_key[calibration_key] = perturbation_xi
@@ -201,7 +217,14 @@ class CalibrationPriorPerturber:
 
         return {calibration_key: (selected_calibration_ids == calibration_id).unsqueeze(-1) for calibration_id, calibration_key in enumerate(calibration_keys)}
 
-    def _perturb_state(self, true_state: CalibrationState, probability: float, calibration_selection_mask: torch.Tensor, generator: torch.Generator | None) -> tuple[CalibrationState, torch.Tensor, torch.Tensor]:
+    def _perturb_state(
+        self,
+        true_state: CalibrationState,
+        probability: float,
+        calibration_selection_mask: torch.Tensor,
+        perturbation_type_masks: dict[str, torch.Tensor],
+        generator: torch.Generator | None,
+    ) -> tuple[CalibrationState, torch.Tensor, torch.Tensor]:
         """Perturb one batched calibration state."""
 
         batch_size = true_state.transform.shape[0]
@@ -222,16 +245,19 @@ class CalibrationPriorPerturber:
         delta_tau = torch.zeros(batch_size, 1, device=device, dtype=dtype)
 
         if self.config.rotation is not None:
-            delta_phi = self._sample_rotation_perturbation(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
-            delta_phi = delta_phi * perturbation_mask
+            delta_phi = self._sample_rotation_perturbation(batch_size=batch_size, device=device, dtype=dtype,generator=generator,)
+            rotation_mask = perturbation_mask * perturbation_type_masks["rotation"].to(dtype=dtype)
+            delta_phi = delta_phi * rotation_mask
 
         if self.config.translation is not None:
-            delta_rho = sample_isotropic_perturbation(config=self.config.translation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
-            delta_rho = delta_rho * perturbation_mask
+            delta_rho = sample_isotropic_perturbation(config=self.config.translation,batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator,)
+            translation_mask = perturbation_mask * perturbation_type_masks["translation"].to(dtype=dtype)
+            delta_rho = delta_rho * translation_mask
 
         if self.config.time_offset is not None:
-            delta_tau = sample_signed_scalar_perturbation(config=self.config.time_offset, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
-            delta_tau = delta_tau * perturbation_mask
+            delta_tau = sample_signed_scalar_perturbation(config=self.config.time_offset, batch_size=batch_size, device=device, dtype=dtype, generator=generator,)
+            time_offset_mask = perturbation_mask * perturbation_type_masks["time_offset"].to(dtype=dtype)
+            delta_tau = delta_tau * time_offset_mask
 
         perturbation_xi = torch.cat((delta_phi, delta_rho), dim=-1)
         perturbation_transform = se3_exp(perturbation_xi)
@@ -262,6 +288,60 @@ class CalibrationPriorPerturber:
         delta_phi.scatter_(dim=1, index=selected_axes, src=signed_angles)
 
         return delta_phi
+
+    def _sample_perturbation_type_masks(
+        self,
+        batch_size: int,
+        device: torch.device,
+        generator: torch.Generator | None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Return one [B, 1] eligibility mask for each perturbation type.
+
+        By default, every configured perturbation type is eligible.
+
+        With one_perturbation_type_per_sample enabled, exactly one configured
+        perturbation type is selected uniformly for every batch item.
+        """
+
+        configured_types = []
+
+        if self.config.rotation is not None:
+            configured_types.append("rotation")
+
+        if self.config.translation is not None:
+            configured_types.append("translation")
+
+        if self.config.time_offset is not None:
+            configured_types.append("time_offset")
+
+        masks = {
+            "rotation": torch.zeros(batch_size, 1, dtype=torch.bool, device=device),
+            "translation": torch.zeros(batch_size, 1, dtype=torch.bool, device=device),
+            "time_offset": torch.zeros(batch_size, 1, dtype=torch.bool, device=device),
+        }
+
+        if not configured_types:
+            return masks
+
+        if not self.config.one_perturbation_type_per_sample:
+            for perturbation_type in configured_types:
+                masks[perturbation_type].fill_(True)
+
+            return masks
+
+        selected_type_ids = torch.randint(
+            low=0,
+            high=len(configured_types),
+            size=(batch_size,),
+            device=device,
+            generator=generator,
+        )
+
+        for perturbation_type_id, perturbation_type in enumerate(configured_types):
+            masks[perturbation_type] = (selected_type_ids == perturbation_type_id).unsqueeze(-1)
+
+        return masks
 
 
 def _validate_calibration(calibration: Mapping[str, CalibrationState]) -> None:

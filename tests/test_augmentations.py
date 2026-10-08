@@ -1662,3 +1662,154 @@ def test_calibration_trajectory_accepts_negative_relative_timestamps() -> None:
     assert time_offsets.shape == (1, 4, 1)
     assert torch.all(torch.isfinite(transforms))
     assert torch.all(torch.isfinite(time_offsets))
+
+def test_prior_perturbation_selects_one_calibration_and_one_type_per_sample() -> None:
+    """
+    With both selection switches enabled, every batch item must perturb exactly
+    one calibration and exactly one configured perturbation type.
+
+    For the rotation-plus-time-offset configuration used by paired training,
+    every item must therefore belong to exactly one of four cases:
+
+        IMU rotation
+        IMU time offset
+        LiDAR rotation
+        LiDAR time offset
+
+    Rotation remains arbitrary 3D because one_rotation_axis_per_sample=False.
+    Translation is disabled and must remain exactly zero.
+    """
+
+    batch_size = 256
+    rotation_max = math.radians(5.0)
+    time_offset_max = 0.01
+
+    calibration_truth = {
+        "imu": _identity_state(batch_size),
+        "lidar": _identity_state(batch_size),
+    }
+
+    config = PriorPerturbationConfig(
+        enabled=True,
+        probability=1.0,
+        rotation=PerturbationMagnitudeConfig(maximum=rotation_max),
+        translation=None,
+        time_offset=PerturbationMagnitudeConfig(maximum=time_offset_max),
+        one_calibration_per_sample=True,
+        one_perturbation_type_per_sample=True,
+        one_rotation_axis_per_sample=False,
+    )
+
+    perturber = CalibrationPriorPerturber(config)
+    generator = torch.Generator().manual_seed(12345)
+
+    calibration_priors, delta_xi_by_key, delta_tau_by_key = perturber(
+        calibration_truth,
+        generator=generator,
+    )
+
+    calibration_keys = ("imu", "lidar")
+
+    rotation_active_by_key = {}
+    time_offset_active_by_key = {}
+
+    for calibration_key in calibration_keys:
+        delta_xi = delta_xi_by_key[calibration_key]
+        delta_tau = delta_tau_by_key[calibration_key]
+
+        assert delta_xi.shape == (batch_size, 6)
+        assert delta_tau.shape == (batch_size, 1)
+
+        # Translation is disabled for this augmentation configuration.
+        torch.testing.assert_close(
+            delta_xi[:, 3:],
+            torch.zeros_like(delta_xi[:, 3:]),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        delta_phi = delta_xi[:, :3]
+
+        rotation_active_by_key[calibration_key] = torch.linalg.vector_norm(delta_phi, dim=-1) > ATOL
+        time_offset_active_by_key[calibration_key] = torch.abs(delta_tau[:, 0]) > ATOL
+
+        # Sampled perturbations must remain inside their configured bounds.
+        assert torch.all(torch.linalg.vector_norm(delta_phi, dim=-1) <= rotation_max + ATOL)
+        assert torch.all(torch.abs(delta_tau[:, 0]) <= time_offset_max + ATOL)
+
+        # Returned priors must correspond exactly to the sampled perturbations.
+        expected_transform = se3_exp(delta_xi) @ calibration_truth[calibration_key].transform
+        expected_time_offset = calibration_truth[calibration_key].time_offset + delta_tau
+
+        torch.testing.assert_close(
+            calibration_priors[calibration_key].transform,
+            expected_transform,
+            atol=ATOL,
+            rtol=RTOL,
+        )
+        torch.testing.assert_close(
+            calibration_priors[calibration_key].time_offset,
+            expected_time_offset,
+            atol=ATOL,
+            rtol=RTOL,
+        )
+
+    imu_rotation_active = rotation_active_by_key["imu"]
+    lidar_rotation_active = rotation_active_by_key["lidar"]
+    imu_tau_active = time_offset_active_by_key["imu"]
+    lidar_tau_active = time_offset_active_by_key["lidar"]
+
+    # Exactly one of the four sensor/type combinations must be active per item.
+    num_active_combinations = torch.stack(
+        (
+            imu_rotation_active,
+            imu_tau_active,
+            lidar_rotation_active,
+            lidar_tau_active,
+        ),
+        dim=1,
+    ).sum(dim=1)
+
+    assert torch.all(num_active_combinations == 1)
+
+    # Therefore exactly one calibration is perturbed per item.
+    imu_active = imu_rotation_active | imu_tau_active
+    lidar_active = lidar_rotation_active | lidar_tau_active
+
+    assert torch.all(imu_active.to(torch.int64) + lidar_active.to(torch.int64) == 1)
+
+    # And exactly one perturbation type is active per item.
+    rotation_active = imu_rotation_active | lidar_rotation_active
+    time_offset_active = imu_tau_active | lidar_tau_active
+
+    assert torch.all(rotation_active.to(torch.int64) + time_offset_active.to(torch.int64) == 1)
+
+    # A reasonably large deterministic batch must exercise both calibrations
+    # and both perturbation types.
+    assert torch.any(imu_active)
+    assert torch.any(lidar_active)
+    assert torch.any(rotation_active)
+    assert torch.any(time_offset_active)
+
+    # Rotation is arbitrary 3D rather than restricted to one Cartesian axis.
+    all_delta_phi = torch.cat(
+        (
+            delta_xi_by_key["imu"][:, :3],
+            delta_xi_by_key["lidar"][:, :3],
+        ),
+        dim=0,
+    )
+
+    active_delta_phi = all_delta_phi[torch.linalg.vector_norm(all_delta_phi, dim=-1) > ATOL]
+    num_nonzero_rotation_components = (torch.abs(active_delta_phi) > ATOL).sum(dim=-1)
+
+    assert active_delta_phi.shape[0] > 0
+    assert torch.any(num_nonzero_rotation_components > 1)
+
+    # Explicitly verify that rotation and temporal perturbation never occur
+    # simultaneously for the selected calibration.
+    for calibration_key in calibration_keys:
+        assert not torch.any(
+            rotation_active_by_key[calibration_key]
+            & time_offset_active_by_key[calibration_key]
+        )

@@ -109,6 +109,7 @@ class PriorPerturbationConfig:
 
     one_calibration_per_sample: bool = False
     one_rotation_axis_per_sample: bool = False
+    one_perturbation_type_per_sample: bool = False
 
     def __post_init__(self) -> None:
         _validate_probability("probability", self.probability)
