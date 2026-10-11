@@ -21,12 +21,13 @@ from .lidar import load_lidar_relative_poses
 
 @dataclass(frozen=True)
 class KAISTSequenceSpec:
-    """Paths and optional IMU selection for one KAIST sequence."""
+    """Paths and optional sensor selection for one KAIST sequence."""
 
     name: str
     sensor_data_root: Path
     lidar_pose_csv: Path
     imu_stream_key: str | None = None
+    lidar_right_pose_csv: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -34,6 +35,12 @@ class KAISTSequenceSpec:
 
         object.__setattr__(self, "sensor_data_root", Path(self.sensor_data_root).expanduser())
         object.__setattr__(self, "lidar_pose_csv", Path(self.lidar_pose_csv).expanduser())
+
+        if self.lidar_right_pose_csv is not None:
+            right_path = Path(self.lidar_right_pose_csv).expanduser()
+            if right_path == self.lidar_pose_csv:
+                raise ValueError("The left and right LiDAR pose CSV paths must differ.")
+            object.__setattr__(self, "lidar_right_pose_csv", right_path)
 
 
 @dataclass(frozen=True)
@@ -47,7 +54,10 @@ class KAISTRigCalibration:
     T_B_L:
         LiDAR sensor frame to common body frame.
 
-    tau_imu_s / tau_lidar_s:
+    T_B_L_right:
+        Optional right LiDAR sensor frame to common body frame.
+
+    tau_imu_s / tau_lidar_s / tau_lidar_right_s:
         Initial additive temporal calibrations.
     """
 
@@ -55,6 +65,8 @@ class KAISTRigCalibration:
     T_B_L: np.ndarray
     tau_imu_s: float = 0.0
     tau_lidar_s: float = 0.0
+    T_B_L_right: np.ndarray | None = None
+    tau_lidar_right_s: float = 0.0
 
     def __post_init__(self) -> None:
         T_B_I = np.asarray(self.T_B_I, dtype=float)
@@ -69,11 +81,18 @@ class KAISTRigCalibration:
         if not np.all(np.isfinite(T_B_I)) or not np.all(np.isfinite(T_B_L)):
             raise ValueError("KAIST rig calibration transforms must contain only finite values.")
 
-        if not np.isfinite(self.tau_imu_s) or not np.isfinite(self.tau_lidar_s):
+        T_B_L_right = None if self.T_B_L_right is None else np.asarray(self.T_B_L_right, dtype=float)
+        if T_B_L_right is not None and T_B_L_right.shape != (4, 4):
+            raise ValueError("T_B_L_right must have shape [4, 4].")
+        if T_B_L_right is not None and not np.all(np.isfinite(T_B_L_right)):
+            raise ValueError("T_B_L_right must contain only finite values.")
+
+        if not np.isfinite(self.tau_imu_s) or not np.isfinite(self.tau_lidar_s) or not np.isfinite(self.tau_lidar_right_s):
             raise ValueError("KAIST temporal calibrations must be finite.")
 
         object.__setattr__(self, "T_B_I", T_B_I)
         object.__setattr__(self, "T_B_L", T_B_L)
+        object.__setattr__(self, "T_B_L_right", T_B_L_right)
 
 
 @dataclass(frozen=True)
@@ -87,9 +106,10 @@ class KAISTSequenceInfo:
     num_windows: int
     common_start_time_s: float
     common_end_time_s: float
+    num_lidar_right_relative_poses: int = 0
 
 
-def build_kaist_sequence_specs(sequence_names: Sequence[str], kaist_dataset_root: str | Path, lidar_pose_root: str | Path, lidar_pose_filename: str = "lidar_map_poses_vlp_left.csv") -> list[KAISTSequenceSpec]:
+def build_kaist_sequence_specs(sequence_names: Sequence[str], kaist_dataset_root: str | Path, lidar_pose_root: str | Path, lidar_pose_filename: str = "lidar_map_poses_vlp_left.csv", lidar_right_pose_filename: str | None = None) -> list[KAISTSequenceSpec]:
     """
     Build conventional KAIST paths from sequence names.
 
@@ -100,6 +120,10 @@ def build_kaist_sequence_specs(sequence_names: Sequence[str], kaist_dataset_root
     and:
 
         <lidar_pose_root>/Urban16/lidar_map_poses_vlp_left.csv
+
+    Pass lidar_right_pose_filename="lidar_map_poses_vlp_right.csv" to opt into
+    the right LiDAR for every requested sequence. The file is then required.
+    The default None preserves the historical IMU + left-LiDAR dataset.
     """
 
     kaist_dataset_root = Path(kaist_dataset_root).expanduser()
@@ -115,6 +139,7 @@ def build_kaist_sequence_specs(sequence_names: Sequence[str], kaist_dataset_root
                 name=sequence_name,
                 sensor_data_root=kaist_dataset_root / sequence_name / f"{sequence_slug}_data" / sequence_slug / "sensor_data",
                 lidar_pose_csv=lidar_pose_root / sequence_name / lidar_pose_filename,
+                lidar_right_pose_csv=None if lidar_right_pose_filename is None else lidar_pose_root / sequence_name / lidar_right_pose_filename,
             )
         )
 
@@ -234,7 +259,8 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
 
         for info in self._sequence_info:
             duration_s = info.common_end_time_s - info.common_start_time_s
-            lines.append(f"  {info.name}: windows={info.num_windows}, duration={duration_s:.1f}s, IMU={info.num_imu_samples}, LiDAR={info.num_lidar_relative_poses}")
+            right_summary = f", right LiDAR={info.num_lidar_right_relative_poses}" if self._calibration_keys == ("imu", "lidar", "lidar_right") else ""
+            lines.append(f"  {info.name}: windows={info.num_windows}, duration={duration_s:.1f}s, IMU={info.num_imu_samples}, LiDAR={info.num_lidar_relative_poses}{right_summary}")
 
         return "\n".join(lines)
 
@@ -247,10 +273,17 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
         if not spec.lidar_pose_csv.is_file():
             raise FileNotFoundError(f"KAIST LiDAR map-pose CSV does not exist for {spec.name!r}: {spec.lidar_pose_csv}")
 
+        if spec.lidar_right_pose_csv is not None:
+            if self.rig_calibration.T_B_L_right is None:
+                raise ValueError(f"Right LiDAR is enabled for {spec.name!r}, but KAISTRigCalibration.T_B_L_right is missing.")
+            if not spec.lidar_right_pose_csv.is_file():
+                raise FileNotFoundError(f"KAIST right LiDAR map-pose CSV does not exist for {spec.name!r}: {spec.lidar_right_pose_csv}")
+
         imu_streams = load_imus(spec.sensor_data_root, target_frequency_hz=None)
         imu_stream_key, imu = _select_primary_imu(imu_streams, spec)
 
         lidar = load_lidar_relative_poses(spec.lidar_pose_csv)
+        lidar_right = None if spec.lidar_right_pose_csv is None else load_lidar_relative_poses(spec.lidar_right_pose_csv)
 
         streams = {
             "gyro": PreprocessedSensorStream(
@@ -285,6 +318,19 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
         common_start_time_s = max(float(imu.timestamps_s[0]), float(lidar.scan_timestamps_s[0]))
         common_end_time_s = min(float(imu.timestamps_s[-1]), float(lidar.scan_timestamps_s[-1]))
 
+        if lidar_right is not None:
+            streams["lidar_right"] = PreprocessedSensorStream(
+                values=lidar_right.relative_poses_se3,
+                timestamps_s=lidar_right.scan_timestamps_s[1:],
+                interval_start_timestamps_s=lidar_right.scan_timestamps_s[:-1],
+                measurement_type=MeasurementType.LIDAR_POSE,
+                geometry_type=GeometryType.SE3,
+                calibration_key="lidar_right",
+            )
+            current_calibration["lidar_right"] = PreprocessedCalibration(transform=self.rig_calibration.T_B_L_right, time_offset_s=self.rig_calibration.tau_lidar_right_s)
+            common_start_time_s = max(common_start_time_s, float(lidar_right.scan_timestamps_s[0]))
+            common_end_time_s = min(common_end_time_s, float(lidar_right.scan_timestamps_s[-1]))
+
         windows = build_window_samples_from_preprocessed(
             streams,
             current_calibration,
@@ -305,6 +351,7 @@ class KAISTCalibrationDataset(Dataset[WindowSample]):
             num_windows=len(windows),
             common_start_time_s=common_start_time_s,
             common_end_time_s=common_end_time_s,
+            num_lidar_right_relative_poses=0 if lidar_right is None else int(len(lidar_right.relative_poses_se3)),
         )
 
         return windows, info

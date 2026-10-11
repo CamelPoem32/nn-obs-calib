@@ -271,7 +271,7 @@ def _sample_truncated_absolute_student_t(
         accepted = candidates[:, 0] <= maximum
 
         unresolved_indices = torch.nonzero(unresolved, as_tuple=False).squeeze(-1)
-        accepted_indices = unresolved_indices[accepted.squeeze(-1)]
+        accepted_indices = unresolved_indices[accepted]
 
         samples[accepted_indices] = candidates[accepted]
         unresolved[accepted_indices] = False
