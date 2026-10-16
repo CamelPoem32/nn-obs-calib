@@ -442,88 +442,54 @@ def _so3_axis_near_pi(rotation: torch.Tensor) -> torch.Tensor:
 
 
 def so3_log(rotation: torch.Tensor) -> torch.Tensor:
-    """
-    Apply the principal logarithmic map from SO(3) to rotation vectors.
+    '''Compute the principal SO(3) logarithm using numerically stable quaternion extraction.'''
+    if rotation.shape[-2:] != (3, 3):
+        raise ValueError("Expected rotation matrices with shape [..., 3, 3].")
 
-    Parameters
-    ----------
-    rotation:
-        Rotation matrices with shape [..., 3, 3].
+    R = rotation
+    r00, r01, r02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
+    r10, r11, r12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
+    r20, r21, r22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
 
-    Returns
-    -------
-    torch.Tensor
-        Principal rotation vectors with shape [..., 3] and angle in [0, pi].
+    eps = torch.finfo(R.dtype).eps
+    trace = r00 + r11 + r22
 
-    Notes
-    -----
-    The logarithm is inherently non-unique at rotations of exactly pi.
-    """
+    # Construct four quaternion candidates [w, x, y, z].
+    # Keep every candidate numerically finite because torch.where evaluates all branches.
+    w0 = 0.5 * torch.sqrt((1.0 + trace).clamp_min(eps))
+    d0 = (4.0 * w0).clamp_min(4.0 * eps**0.5)
+    q0 = torch.stack((w0, (r21-r12)/d0, (r02-r20)/d0, (r10-r01)/d0), dim=-1)
 
-    _validate_matrix(rotation, 3, 3, "rotation")
+    x1 = 0.5 * torch.sqrt((1.0 + r00-r11-r22).clamp_min(eps))
+    d1 = (4.0 * x1).clamp_min(4.0 * eps**0.5)
+    q1 = torch.stack(((r21-r12)/d1, x1, (r01+r10)/d1, (r02+r20)/d1), dim=-1)
 
-    # Recover cos(theta) from the trace.
-    trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    cos_theta = torch.clamp(
-        0.5 * (trace - 1.0),
-        min=-1.0,
-        max=1.0,
-    )
+    y2 = 0.5 * torch.sqrt((1.0-r00+r11-r22).clamp_min(eps))
+    d2 = (4.0 * y2).clamp_min(4.0 * eps**0.5)
+    q2 = torch.stack(((r02-r20)/d2, (r01+r10)/d2, y2, (r12+r21)/d2), dim=-1)
 
-    # vee(R - R^T) = 2 sin(theta) * axis.
-    antisymmetric_vector = so3_vee(
-        rotation - rotation.transpose(-1, -2)
-    )
-    sin_theta_abs = 0.5 * torch.linalg.vector_norm(
-        antisymmetric_vector,
-        dim=-1,
-    )
+    z3 = 0.5 * torch.sqrt((1.0-r00-r11+r22).clamp_min(eps))
+    d3 = (4.0 * z3).clamp_min(4.0 * eps**0.5)
+    q3 = torch.stack(((r10-r01)/d3, (r02+r20)/d3, (r12+r21)/d3, z3), dim=-1)
 
-    # atan2 provides better angle behavior than acos near theta = 0.
-    theta = torch.atan2(sin_theta_abs, cos_theta)
-    theta_sq = theta * theta
+    # Select the numerically favorable quaternion extraction branch.
+    dominant_axis = torch.stack((r00, r11, r22), dim=-1).argmax(dim=-1)
+    q_diagonal = torch.where((dominant_axis == 0)[..., None], q1, torch.where((dominant_axis == 1)[..., None], q2, q3))
+    q = torch.where((trace > 0)[..., None], q0, q_diagonal)
 
-    small_angle = theta_sq < _SMALL_ANGLE_SQ
-    near_pi = torch.abs(math.pi - theta) < _NEAR_PI_THRESHOLD
+    q = q / torch.linalg.vector_norm(q, dim=-1, keepdim=True).clamp_min(eps)
+    q = torch.where(q[..., :1] < 0, -q, q)
 
-    # Standard branch:
-    #
-    #     phi = theta / (2 sin(theta)) * vee(R - R^T).
-    #
-    # Replace the denominator while evaluating the unused small-angle branch
-    # so no division by zero enters autograd.
-    safe_sin_theta = torch.where(
-        small_angle,
-        torch.ones_like(sin_theta_abs),
-        sin_theta_abs,
-    )
-    coefficient_regular = theta / (2.0 * safe_sin_theta)
+    # Convert the quaternion into a principal rotation vector.
+    v = q[..., 1:]
+    sin_half = torch.linalg.vector_norm(v, dim=-1)
+    angle = 2.0 * torch.atan2(sin_half, q[..., 0])
 
-    theta_fourth = theta_sq * theta_sq
+    coefficient_small = 2.0 + sin_half.square()/3.0 + 3.0*sin_half.pow(4)/20.0
+    coefficient_regular = angle / sin_half.clamp_min(eps**0.5)
+    coefficient = torch.where(sin_half < 1e-3, coefficient_small, coefficient_regular)
 
-    # theta / (2 sin(theta))
-    coefficient_small = (
-        0.5
-        + theta_sq / 12.0
-        + 7.0 * theta_fourth / 720.0
-    )
-
-    phi_regular = torch.where(
-        small_angle[..., None],
-        coefficient_small[..., None] * antisymmetric_vector,
-        coefficient_regular[..., None] * antisymmetric_vector,
-    )
-
-    # Near pi, recover the axis from the symmetric/diagonal matrix terms
-    # because the antisymmetric part approaches zero.
-    axis_near_pi = _so3_axis_near_pi(rotation)
-    phi_near_pi = theta[..., None] * axis_near_pi
-
-    return torch.where(
-        near_pi[..., None],
-        phi_near_pi,
-        phi_regular,
-    )
+    return coefficient[..., None] * v
 
 
 def se3_hat(xi: torch.Tensor) -> torch.Tensor:
