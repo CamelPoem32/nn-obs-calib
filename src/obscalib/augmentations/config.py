@@ -402,9 +402,18 @@ class CommonBodyFrameRandomizationConfig:
 
     enabled: bool = False
     probability: float = 1.0
+    # None preserves the old full-SO(3) Haar-uniform sampler (no angle limit).
+    # A PerturbationMagnitudeConfig selects a uniformly sampled angle in
+    # [0, rotation.maximum] about an independently sampled uniform 3D axis.
+    rotation: PerturbationMagnitudeConfig | None = None
 
     def __post_init__(self) -> None:
         _validate_probability("common_body_frame.probability", self.probability)
+        if self.rotation is not None:
+            if self.rotation.distribution != PerturbationDistribution.UNIFORM:
+                raise ValueError("common_body_frame.rotation currently supports only UNIFORM angle sampling.")
+            if self.rotation.maximum > math.pi:
+                raise ValueError("common_body_frame.rotation.maximum must not exceed pi radians (180 degrees).")
 
 
 @dataclass(frozen=True)

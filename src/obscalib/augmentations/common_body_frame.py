@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 
+from obscalib.geometry.lie import so3_exp
 from obscalib.augmentations.config import CommonBodyFrameRandomizationConfig
 from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import CalibrationTargetBatch, WindowBatch
@@ -31,6 +32,8 @@ class CommonBodyFrameRandomizer:
     Returns (augmented_window, transformed_calibration, H_G), where H_G has
     shape [B, 4, 4] and is identical for all sensors in each batch element.
     For samples not selected by ``probability``, H_G is exactly the identity.
+    If config.rotation is None, sample a full Haar-uniform SO(3) rotation.
+    Otherwise draw a uniform rotation axis and angle in [0, rotation.maximum].
     """
 
     def __init__(self, config: CommonBodyFrameRandomizationConfig) -> None:
@@ -48,7 +51,13 @@ class CommonBodyFrameRandomizer:
         if self.config.enabled and self.config.probability > 0.0:
             from obscalib.augmentations.sampling import sample_uniform_so3
 
-            sampled_rotation = sample_uniform_so3(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+            if self.config.rotation is None:
+                # Backwards-compatible path: Haar-uniform on the entire SO(3).
+                sampled_rotation = sample_uniform_so3(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+            else:
+                # Angle-limited curriculum path: uniform rotation axis, uniform
+                # angle in [0, max_angle].  This is NOT Haar-conditioned sampling.
+                sampled_rotation = _sample_bounded_rotation(batch_size, self.config.rotation.maximum, device=device, dtype=dtype, generator=generator)
             if self.config.probability == 1.0:
                 selected = torch.ones(batch_size, device=device, dtype=torch.bool)
             else:
@@ -74,6 +83,17 @@ class CommonBodyFrameRandomizer:
         )
         return augmented_window, new_calibration, common_frame
 
+
+
+def _sample_bounded_rotation(batch_size: int, maximum: float, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
+    """Sample rotations with angles uniform in [0, maximum] and axes uniform on S²."""
+    axis = torch.randn(batch_size, 3, device=device, dtype=dtype, generator=generator)
+    norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(axis)
+    fallback[:, 0] = 1.0
+    axis = torch.where(norm > 1e-12, axis / norm.clamp_min(1e-12), fallback)
+    angle = torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator) * maximum
+    return so3_exp(axis * angle)
 
 def _transform_target(target: CalibrationTargetBatch, common_frame: torch.Tensor) -> CalibrationTargetBatch:
     """Transform body-frame target poses; retain time and event supervision."""

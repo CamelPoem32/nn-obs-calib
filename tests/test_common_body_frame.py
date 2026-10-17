@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import math
 
 from obscalib.augmentations.common_body_frame import CommonBodyFrameRandomizer
-from obscalib.augmentations.config import CommonBodyFrameRandomizationConfig
+from obscalib.augmentations.config import CommonBodyFrameRandomizationConfig, PerturbationMagnitudeConfig, PerturbationDistribution
 from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import CalibrationTargetBatch, SensorStreamBatch, WindowBatch
 
@@ -99,3 +100,43 @@ def test_left_multiplicative_correction_target_transforms_by_conjugation():
     new_correction = changed_window.targets["imu"].next_transform @ torch.linalg.inv(H @ wrong_transform)
     torch.testing.assert_close(new_correction, H @ old_correction @ torch.linalg.inv(H), rtol=1e-11, atol=1e-11)
     assert not torch.allclose(H[0], H[1]), "Different independent batch items should sample different common frames."
+
+
+@pytest.mark.parametrize("max_degrees", [15.0, 30.0, 60.0, 90.0, 135.0, 180.0])
+def test_bounded_rotation_angle_and_shared_geometry(max_degrees):
+    window = sample_window(batch_size=64)
+    cfg = CommonBodyFrameRandomizationConfig(enabled=True, probability=1.0, rotation=PerturbationMagnitudeConfig(maximum=math.radians(max_degrees)))
+    augmented, states, H = CommonBodyFrameRandomizer(cfg)(window, generator=torch.Generator().manual_seed(100))
+    G = H[:, :3, :3]
+    cos_angle = ((G.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
+    angles = torch.acos(cos_angle)
+    assert bool((angles <= math.radians(max_degrees) + 1e-6).all())
+    torch.testing.assert_close(G @ G.transpose(-1, -2), torch.eye(3, dtype=G.dtype).expand_as(G), atol=1e-11, rtol=1e-11)
+    torch.testing.assert_close(torch.linalg.det(G), torch.ones(64, dtype=G.dtype), atol=1e-11, rtol=1e-11)
+    torch.testing.assert_close(torch.linalg.inv(states["lidar"].transform) @ states["imu"].transform,
+                               torch.linalg.inv(window.current_calibration["lidar"].transform) @ window.current_calibration["imu"].transform, atol=1e-11, rtol=1e-11)
+    for key in window.streams:
+        assert augmented.streams[key] is window.streams[key]
+
+
+def test_bounded_rotation_probability_and_seed_reproducibility():
+    window = sample_window(batch_size=64)
+    cfg = CommonBodyFrameRandomizationConfig(enabled=True, probability=0.5, rotation=PerturbationMagnitudeConfig(maximum=0.5))
+    _, _, H1 = CommonBodyFrameRandomizer(cfg)(window, generator=torch.Generator().manual_seed(123))
+    _, _, H2 = CommonBodyFrameRandomizer(cfg)(window, generator=torch.Generator().manual_seed(123))
+    torch.testing.assert_close(H1, H2, rtol=0.0, atol=0.0)
+    identity = torch.eye(4, dtype=H1.dtype)
+    is_identity = (H1 - identity).abs().amax(dim=(-1, -2)) < 1e-12
+    assert bool(is_identity.any() and (~is_identity).any())
+
+
+def test_bounded_config_validation_and_haar_default():
+    default = CommonBodyFrameRandomizationConfig(enabled=True)
+    assert default.rotation is None
+    for kwargs in [
+        {"maximum": 3.141592653589793 + 1e-5},
+    ]:
+        with pytest.raises(ValueError):
+            CommonBodyFrameRandomizationConfig(enabled=True, rotation=PerturbationMagnitudeConfig(**kwargs))
+    with pytest.raises(ValueError):
+        CommonBodyFrameRandomizationConfig(enabled=True, rotation=PerturbationMagnitudeConfig(maximum=0.5, distribution=PerturbationDistribution.TRUNCATED_NORMAL, scale=0.2))
