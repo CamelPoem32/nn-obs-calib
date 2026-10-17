@@ -6,6 +6,7 @@ import torch
 
 from obscalib.augmentations.calibration_event import CalibrationEventSampler
 from obscalib.augmentations.config import AugmentationConfig
+from obscalib.augmentations.common_body_frame import CommonBodyFrameRandomizer
 from obscalib.augmentations.frame_randomization import SensorFrameRandomizer
 from obscalib.augmentations.noise import MeasurementNoiseAugmenter
 from obscalib.augmentations.prior_perturbation import CalibrationPriorPerturber
@@ -29,14 +30,15 @@ class AugmentationPipeline:
         self.event_renderer = CalibrationEventRenderer()
         self.noise_augmenter = MeasurementNoiseAugmenter(config.noise)
         self.true_calibration_augmenter = TrueCalibrationAugmenter(config.true_calibration)
+        self.common_body_frame_randomizer = CommonBodyFrameRandomizer(config.common_body_frame)
 
     def __call__(self, window: WindowBatch, generator: torch.Generator | None = None) -> AugmentationResult:
         """Apply configured augmentation stages and return augmented data, truth, and sampled metadata."""
 
         _validate_window(window)
 
-        # Source supervision describes the original window and becomes stale as
-        # soon as synthetic calibration physics is introduced.
+        # Preserve source targets during intermediate stages for backwards
+        # compatibility; final supervision is rebuilt from synthetic truth.
         working_window = _copy_window_without_targets(window)
 
         # Sampling-rate augmentation operates on the clean raw measurements.
@@ -49,6 +51,13 @@ class AugmentationPipeline:
         working_window, true_pre_event_calibration, frame_randomization = self.frame_randomizer(working_window, generator=generator)
 
         working_window, true_pre_event_calibration, true_delta_phi, true_delta_tau = self.true_calibration_augmenter(working_window, generator=generator)
+
+        # Change the COMMON coordinate frame, not the individual sensor frames.
+        # One shared rotation is applied to all true extrinsics in each batch item.
+        # Raw sensor values, LiDAR increments, and timestamps remain untouched.
+        # Apply before sampling model priors so calibration targets and priors
+        # are expressed in the same randomly rotated body frame.
+        working_window, true_pre_event_calibration, _common_body_frame = self.common_body_frame_randomizer(working_window, generator=generator)
 
         # The model prior is independent of the true physical calibration event.
         current_prior, prior_perturbation_xi, prior_perturbation_tau = self.prior_perturber(true_pre_event_calibration, generator=generator)
@@ -88,6 +97,9 @@ class AugmentationPipeline:
         # does not smooth or otherwise alter the synthetic noise realization.
         augmented_window, noise_bias = self.noise_augmenter(working_window, generator=generator)
 
+        # AugmentationRecord currently has no dedicated common-body-frame field.
+        # Do not put _common_body_frame into frame_randomization_by_key: that
+        # field represents a different, per-sensor right-multiplication.
         record = AugmentationRecord(
             calibration_keys=tuple(true_pre_event_calibration),
             sampling_target_frequency_hz_by_stream=sampling_target_frequency_hz,
@@ -109,7 +121,7 @@ class AugmentationPipeline:
 
 
 def _copy_window_without_targets(window: WindowBatch) -> WindowBatch:
-    """Copy a raw window while invalidating source supervision before synthetic augmentation."""
+    """Copy a raw window and its original supervision (replaced before return)."""
 
     return WindowBatch(
         streams=dict(window.streams),

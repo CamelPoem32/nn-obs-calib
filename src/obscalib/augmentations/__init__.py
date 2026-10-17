@@ -4,14 +4,17 @@ from obscalib.augmentations.calibration_event import CalibrationEventSampler
 from obscalib.augmentations.config import (
     AugmentationConfig,
     CalibrationEventConfig,
+    CommonBodyFrameRandomizationConfig,
     FrameRandomizationConfig,
     NoiseAugmentationConfig,
     PerturbationDistribution,
     PerturbationMagnitudeConfig,
     PriorPerturbationConfig,
     SamplingRateAugmentationConfig,
+    TrueCalibrationAugmentationConfig,
 )
 from obscalib.augmentations.frame_randomization import SensorFrameRandomizer
+from obscalib.augmentations.common_body_frame import CommonBodyFrameRandomizer
 from obscalib.augmentations.noise import MeasurementNoiseAugmenter
 from obscalib.augmentations.pipeline import AugmentationPipeline
 from obscalib.augmentations.prior_perturbation import CalibrationPriorPerturber, apply_prior_perturbation
@@ -23,6 +26,7 @@ from obscalib.augmentations.structures import (
     CalibrationTrajectory,
 )
 from obscalib.augmentations.sampling_rate import SamplingRateAugmenter
+from obscalib.augmentations.true_calibration import TrueCalibrationAugmenter
 
 __all__ = [
     "AugmentationConfig",
@@ -31,6 +35,8 @@ __all__ = [
     "AugmentationResult",
     "CalibrationEvent",
     "CalibrationEventConfig",
+    "CommonBodyFrameRandomizationConfig",
+    "CommonBodyFrameRandomizer",
     "CalibrationEventSampler",
     "CalibrationPriorPerturber",
     "CalibrationTrajectory",
@@ -42,6 +48,8 @@ __all__ = [
     "PriorPerturbationConfig",
     "SensorFrameRandomizer",
     "TransitionProfile",
+    "TrueCalibrationAugmentationConfig",
+    "TrueCalibrationAugmenter",
     "SamplingRateAugmentationConfig",
     "SamplingRateAugmenter",
     "apply_prior_perturbation",
