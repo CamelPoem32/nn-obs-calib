@@ -32,8 +32,10 @@ class CommonBodyFrameRandomizer:
     Returns (augmented_window, transformed_calibration, H_G), where H_G has
     shape [B, 4, 4] and is identical for all sensors in each batch element.
     For samples not selected by ``probability``, H_G is exactly the identity.
-    If config.rotation is None, sample a full Haar-uniform SO(3) rotation.
-    Otherwise draw a uniform rotation axis and angle in [0, rotation.maximum].
+    With three enabled axes and no angle bound, sample Haar-uniform SO(3).
+    Otherwise draw one rotation whose axis lies in the enabled axis subspace.
+    With one selected axis (e.g., Z), its signed angle is uniform in
+    [-maximum, +maximum] or [-pi, +pi] if the bound is omitted.
     """
 
     def __init__(self, config: CommonBodyFrameRandomizationConfig) -> None:
@@ -51,13 +53,14 @@ class CommonBodyFrameRandomizer:
         if self.config.enabled and self.config.probability > 0.0:
             from obscalib.augmentations.sampling import sample_uniform_so3
 
-            if self.config.rotation is None:
-                # Backwards-compatible path: Haar-uniform on the entire SO(3).
+            if self.config.rotation is None and all(self.config.rotation_axes):
+                # Preserve the original unrestricted Haar sampler exactly.
                 sampled_rotation = sample_uniform_so3(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
             else:
-                # Angle-limited curriculum path: uniform rotation axis, uniform
-                # angle in [0, max_angle].  This is NOT Haar-conditioned sampling.
-                sampled_rotation = _sample_bounded_rotation(batch_size, self.config.rotation.maximum, device=device, dtype=dtype, generator=generator)
+                # Restrict the axis subspace and optionally the rotation angle.
+                # Z-only samples signed yaw: [-max_angle,+max_angle].
+                maximum = torch.pi if self.config.rotation is None else self.config.rotation.maximum
+                sampled_rotation = _sample_bounded_rotation(batch_size, maximum, self.config.rotation_axes, device=device, dtype=dtype, generator=generator)
             if self.config.probability == 1.0:
                 selected = torch.ones(batch_size, device=device, dtype=torch.bool)
             else:
@@ -85,12 +88,13 @@ class CommonBodyFrameRandomizer:
 
 
 
-def _sample_bounded_rotation(batch_size: int, maximum: float, *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
-    """Sample rotations with angles uniform in [0, maximum] and axes uniform on S²."""
-    axis = torch.randn(batch_size, 3, device=device, dtype=dtype, generator=generator)
+def _sample_bounded_rotation(batch_size: int, maximum: float, rotation_axes: tuple[bool, bool, bool], *, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
+    """Sample one SO(3) axis in the allowed subspace and a uniform bounded magnitude."""
+    axis_mask = torch.tensor(rotation_axes, device=device, dtype=dtype)
+    axis = torch.randn(batch_size, 3, device=device, dtype=dtype, generator=generator) * axis_mask
     norm = torch.linalg.vector_norm(axis, dim=-1, keepdim=True)
     fallback = torch.zeros_like(axis)
-    fallback[:, 0] = 1.0
+    fallback[:, rotation_axes.index(True)] = 1.0
     axis = torch.where(norm > 1e-12, axis / norm.clamp_min(1e-12), fallback)
     angle = torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator) * maximum
     return so3_exp(axis * angle)

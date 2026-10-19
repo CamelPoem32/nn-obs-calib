@@ -402,13 +402,23 @@ class CommonBodyFrameRandomizationConfig:
 
     enabled: bool = False
     probability: float = 1.0
-    # None preserves the old full-SO(3) Haar-uniform sampler (no angle limit).
-    # A PerturbationMagnitudeConfig selects a uniformly sampled angle in
-    # [0, rotation.maximum] about an independently sampled uniform 3D axis.
+    # (X, Y, Z) rotation-axis mask, expressed in the OUTPUT/common body frame.
+    # (False, False, True) selects yaw only about the common frame's +Z axis.
+    # Multiple enabled axes select the axis of ONE SO(3) rotation in their span.
+    # This is NOT a product of independent Euler rotations.
+    rotation_axes: tuple[bool, bool, bool] = (True, True, True)
+
+    # None: preserve Haar-uniform SO(3) when all three axes are enabled;
+    # otherwise sample a full signed rotation within the allowed axis subspace.
+    # With a bounded config: sample the angle uniformly in [0, maximum] and a
+    # symmetric unit axis in the selected subspace. One selected axis therefore
+    # gives a signed angle uniform in [-maximum, +maximum].
     rotation: PerturbationMagnitudeConfig | None = None
 
     def __post_init__(self) -> None:
         _validate_probability("common_body_frame.probability", self.probability)
+        if not isinstance(self.rotation_axes, tuple) or len(self.rotation_axes) != 3 or not all(type(value) is bool for value in self.rotation_axes) or not any(self.rotation_axes):
+            raise ValueError("common_body_frame.rotation_axes must be a three-boolean (X, Y, Z) tuple with at least one enabled axis.")
         if self.rotation is not None:
             if self.rotation.distribution != PerturbationDistribution.UNIFORM:
                 raise ValueError("common_body_frame.rotation currently supports only UNIFORM angle sampling.")

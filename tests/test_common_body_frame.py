@@ -140,3 +140,41 @@ def test_bounded_config_validation_and_haar_default():
             CommonBodyFrameRandomizationConfig(enabled=True, rotation=PerturbationMagnitudeConfig(**kwargs))
     with pytest.raises(ValueError):
         CommonBodyFrameRandomizationConfig(enabled=True, rotation=PerturbationMagnitudeConfig(maximum=0.5, distribution=PerturbationDistribution.TRUNCATED_NORMAL, scale=0.2))
+
+@pytest.mark.parametrize('axis_index', (0, 1, 2))
+@pytest.mark.parametrize('maximum_degrees', (15.0, 90.0, 180.0))
+def test_axis_restricted_frame_sampling(axis_index, maximum_degrees):
+    window = sample_window(batch_size=256)
+    axes = tuple(index == axis_index for index in range(3))
+    config = CommonBodyFrameRandomizationConfig(enabled=True, probability=1.0, rotation_axes=axes, rotation=PerturbationMagnitudeConfig(maximum=math.radians(maximum_degrees)))
+    output, calibration, H = CommonBodyFrameRandomizer(config)(window, generator=torch.Generator().manual_seed(42))
+    rotations = H[:, :3, :3]
+    basis = torch.eye(3, dtype=rotations.dtype)[axis_index].expand(len(rotations), 3)
+    torch.testing.assert_close(rotations @ basis.unsqueeze(-1), basis.unsqueeze(-1), atol=1e-10, rtol=1e-10)
+    angles = torch.acos(((rotations.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) * 0.5).clamp(-1.0, 1.0))
+    assert bool((angles <= math.radians(maximum_degrees) + 1e-6).all())
+    if axis_index == 2:
+        signed_yaw = torch.atan2(rotations[:, 1, 0], rotations[:, 0, 0])
+        assert bool((signed_yaw > 0).any() and (signed_yaw < 0).any())
+        assert bool((signed_yaw.abs() <= math.radians(maximum_degrees) + 1e-6).all())
+    for key in window.streams:
+        assert output.streams[key] is window.streams[key]
+    torch.testing.assert_close(torch.linalg.inv(calibration['lidar'].transform) @ calibration['imu'].transform, torch.linalg.inv(window.current_calibration['lidar'].transform) @ window.current_calibration['imu'].transform, atol=1e-11, rtol=1e-11)
+
+
+def test_yaw_only_unbounded_sampling_uses_full_signed_circle():
+    window = sample_window(batch_size=512)
+    config = CommonBodyFrameRandomizationConfig(enabled=True, probability=1.0, rotation_axes=(False, False, True))
+    _, _, H = CommonBodyFrameRandomizer(config)(window, generator=torch.Generator().manual_seed(123))
+    rotations = H[:, :3, :3]
+    yaw = torch.atan2(rotations[:, 1, 0], rotations[:, 0, 0])
+    assert bool((yaw > math.radians(150)).any())
+    assert bool((yaw < -math.radians(150)).any())
+    assert torch.allclose(rotations[:, 2, 2], torch.ones(len(rotations), dtype=rotations.dtype), atol=1e-10)
+
+
+def test_axis_mask_validation_and_old_default():
+    assert CommonBodyFrameRandomizationConfig(enabled=True).rotation_axes == (True, True, True)
+    for invalid in ((False, False, False), (True, False), (True, 0, True), [False, False, True]):
+        with pytest.raises(ValueError):
+            CommonBodyFrameRandomizationConfig(enabled=True, rotation_axes=invalid)
