@@ -63,17 +63,50 @@ class PerturbationMagnitudeConfig:
             raise ValueError("degrees_of_freedom must be a positive integer.")
 
 
+
 @dataclass(frozen=True)
 class FrameRandomizationConfig:
-    """Configuration for arbitrary physical sensor-frame orientation randomization.
+    """
+    Independent right-multiplicative sensor-frame randomization.
 
-    When enabled, one arbitrary SO3 rotation will be sampled independently for
-    each physical calibration key and batch item. The sampled transformation
-    will be represented and recorded as an SE3 matrix with zero translation.
+    A different SE(3) coordinate transformation is sampled for each selected
+    physical calibration key and each batch example.
+
+        T_BS_new = T_BS_old @ A_S
+
+    Native sensor measurements are re-expressed using the inverse frame
+    transformation so that the underlying physical observations are unchanged.
     """
 
-    # Enable or disable arbitrary orientation randomization of physical sensor frames.
     enabled: bool = False
+
+    # Probability that a batch example receives the selected sensor-frame changes.
+    probability: float = 1.0
+
+    # None selects every physical sensor per window. Otherwise select exactly
+    # this many distinct calibration keys without replacement.
+    sensors_per_window: int | None = None
+
+    # Rotation-vector magnitude [rad]. None retains legacy Haar SO(3)
+    # behavior when translation is also None.
+    rotation: PerturbationMagnitudeConfig | None = None
+
+    # Sensor-frame origin translation [m]. Disabled by default.
+    translation: PerturbationMagnitudeConfig | None = None
+
+    # Optional restriction on which sensor keys may receive translations.
+    # Example: ("lidar", "lidar_right"). Rotation selection is unaffected.
+    translation_keys: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        _validate_probability("frame_randomization.probability", self.probability)
+
+        if self.sensors_per_window is not None and (not isinstance(self.sensors_per_window, int) or isinstance(self.sensors_per_window, bool) or self.sensors_per_window < 0):
+            raise ValueError("sensors_per_window must be None or a nonnegative integer.")
+
+        if self.translation_keys is not None and (len(set(self.translation_keys)) != len(self.translation_keys) or any(not key for key in self.translation_keys)):
+            raise ValueError("translation_keys must contain distinct nonempty calibration keys.")
+
 
 
 @dataclass(frozen=True)
@@ -427,6 +460,42 @@ class CommonBodyFrameRandomizationConfig:
 
 
 @dataclass(frozen=True)
+class SensorTopologyAugmentationConfig:
+    """Mix genuine KAIST (1 IMU + 2 LiDAR) and synthetic (2 IMU + 1 LiDAR) rigs.
+
+    When enabled, replacement_probability=0.5 and replace_first_lidar_probability=0.5
+    produce 50% original, 25% replacing the first LiDAR, and 25% replacing the second.
+    """
+
+    enabled: bool = False
+    replacement_probability: float = 0.5
+    replace_first_lidar_probability: float = 0.5
+    source_imu_key: str = "imu"
+    lidar_keys: tuple[str, str] = ("lidar", "lidar_right")
+    synthetic_calibration_key: str = "imu_synth"
+    synthetic_gyro_stream: str = "gyro_synth"
+    synthetic_accel_stream: str = "accel_synth"
+    maximum_mount_rotation_deg: float = 180.0
+    synthetic_gyro_noise_std: float = 0.0       # rad/s
+    synthetic_accel_noise_std: float = 0.0      # m/s^2
+
+    def __post_init__(self) -> None:
+        _validate_probability("sensor_topology.replacement_probability", self.replacement_probability)
+        _validate_probability("sensor_topology.replace_first_lidar_probability", self.replace_first_lidar_probability)
+        if len(self.lidar_keys) != 2 or len({self.source_imu_key, *self.lidar_keys, self.synthetic_calibration_key}) != 4:
+            raise ValueError("source IMU, both real LiDARs and synthetic IMU must have distinct calibration keys.")
+        if len({self.synthetic_gyro_stream, self.synthetic_accel_stream}) != 2 or not all((self.synthetic_gyro_stream, self.synthetic_accel_stream)):
+            raise ValueError("Synthetic gyro and accelerometer stream names must be distinct and nonempty.")
+        if not math.isfinite(self.maximum_mount_rotation_deg) or not 0.0 <= self.maximum_mount_rotation_deg <= 180.0:
+            raise ValueError("maximum_mount_rotation_deg must be in [0, 180].")
+        for name in ("synthetic_gyro_noise_std", "synthetic_accel_noise_std"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative.")
+
+
+
+@dataclass(frozen=True)
 class AugmentationConfig:
     """Top-level composition of independently configurable augmentation stages."""
 
@@ -437,6 +506,7 @@ class AugmentationConfig:
     noise: NoiseAugmentationConfig = field(default_factory=NoiseAugmentationConfig)
     true_calibration: TrueCalibrationAugmentationConfig = field(default_factory=TrueCalibrationAugmentationConfig)
     common_body_frame: CommonBodyFrameRandomizationConfig = field(default_factory=CommonBodyFrameRandomizationConfig)
+    sensor_topology: SensorTopologyAugmentationConfig = field(default_factory=SensorTopologyAugmentationConfig)
 
 
 def _validate_probability(name: str, probability: float) -> None:

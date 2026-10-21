@@ -12,6 +12,7 @@ from obscalib.augmentations.config import (
     PriorPerturbationConfig,
     SamplingRateAugmentationConfig,
     TrueCalibrationAugmentationConfig,
+    SensorTopologyAugmentationConfig,
 )
 from obscalib.augmentations.frame_randomization import SensorFrameRandomizer
 from obscalib.augmentations.common_body_frame import CommonBodyFrameRandomizer
@@ -27,6 +28,7 @@ from obscalib.augmentations.structures import (
 )
 from obscalib.augmentations.sampling_rate import SamplingRateAugmenter
 from obscalib.augmentations.true_calibration import TrueCalibrationAugmenter
+from obscalib.augmentations.sensor_topology import SensorTopologyAugmenter
 
 __all__ = [
     "AugmentationConfig",
@@ -53,4 +55,6 @@ __all__ = [
     "SamplingRateAugmentationConfig",
     "SamplingRateAugmenter",
     "apply_prior_perturbation",
+    "SensorTopologyAugmentationConfig",
+    "SensorTopologyAugmenter",
 ]

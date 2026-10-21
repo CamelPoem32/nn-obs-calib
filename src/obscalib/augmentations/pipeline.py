@@ -16,6 +16,7 @@ from obscalib.augmentations.structures import AugmentationRecord, AugmentationRe
 from obscalib.augmentations.targets import build_augmented_targets
 from obscalib.data.structures import WindowBatch
 from obscalib.augmentations.true_calibration import TrueCalibrationAugmenter
+from obscalib.augmentations.sensor_topology import SensorTopologyAugmenter
 
 
 class AugmentationPipeline:
@@ -31,20 +32,29 @@ class AugmentationPipeline:
         self.noise_augmenter = MeasurementNoiseAugmenter(config.noise)
         self.true_calibration_augmenter = TrueCalibrationAugmenter(config.true_calibration)
         self.common_body_frame_randomizer = CommonBodyFrameRandomizer(config.common_body_frame)
+        self.sensor_topology_augmenter = SensorTopologyAugmenter(config.sensor_topology)
 
     def __call__(self, window: WindowBatch, generator: torch.Generator | None = None) -> AugmentationResult:
         """Apply configured augmentation stages and return augmented data, truth, and sampled metadata."""
 
+
         _validate_window(window)
 
-        # Preserve source targets during intermediate stages for backwards
-        # compatibility; final supervision is rebuilt from synthetic truth.
+        # Preserve source measurements and clear supervision only when final targets are constructed.
         working_window = _copy_window_without_targets(window)
 
-        # Sampling-rate augmentation operates on the clean raw measurements.
-        # IMU streams are linearly resampled and LiDAR relative poses are
-        # reduced by SE3 composition.
+        # Select the physical sensor topology before any later augmentation stage.
+        # Original: one IMU and two genuine LiDARs.
+        # Synthetic: one genuine LiDAR and two IMUs, including one consistently re-expressed synthetic IMU.
+        # Sampling is per homogeneous WindowBatch. No fake LiDAR measurements or key relabeling.
+        working_window, _topology_choice = self.sensor_topology_augmenter(working_window, generator=generator)
+
+        # Downstream samplers now see the actual active sensor streams and calibration keys.
+        _validate_window(working_window)
+
+        # Sampling-rate augmentation applies to the selected physical topology.
         working_window, sampling_target_frequency_hz, sampling_rate_applied = self.sampling_rate_augmenter(working_window, generator=generator)
+
 
         # Randomize the physical sensor frames before sampling calibration
         # priors or true calibration events.

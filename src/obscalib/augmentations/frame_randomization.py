@@ -8,7 +8,8 @@ from obscalib.augmentations.config import FrameRandomizationConfig
 from obscalib.augmentations.sampling import sample_uniform_so3
 from obscalib.calibration.state import CalibrationState
 from obscalib.data.structures import GeometryType, SensorStreamBatch, WindowBatch
-
+from obscalib.augmentations.sampling import sample_isotropic_perturbation
+from obscalib.geometry.lie import so3_exp
 
 class SensorFrameRandomizer:
     """
@@ -58,10 +59,9 @@ class SensorFrameRandomizer:
         if not self.config.enabled:
             return _copy_window(window), dict(window.current_calibration), {}
 
-        frame_randomization_by_key = _sample_frame_randomizations(
-            window=window,
-            generator=generator,
-        )
+        
+        frame_randomization_by_key = _sample_frame_randomizations(window=window, config=self.config, generator=generator)
+
 
         randomized_calibration = _randomize_calibration(
             calibration=window.current_calibration,
@@ -88,47 +88,81 @@ class SensorFrameRandomizer:
         return randomized_window, randomized_calibration, frame_randomization_by_key
 
 
-def _sample_frame_randomizations(
-    window: WindowBatch,
-    generator: torch.Generator | None,
-) -> dict[str, torch.Tensor]:
-    """Sample one independent orientation randomization per used calibration key."""
 
-    calibration_keys = {
-        metadata.calibration_key
-        for metadata in window.metadata.values()
-    }
+def _sample_frame_randomizations(window: WindowBatch, config: FrameRandomizationConfig, generator: torch.Generator | None) -> dict[str, torch.Tensor]:
+    """
+    Sample independent frame transformations for exactly N sensor keys per active window.
+
+    A sensor key is selected once, even if it has several raw streams
+    such as gyroscope and accelerometer.
+
+    Returns dense [B, 4, 4] matrices for every sensor key. Unselected
+    sensors receive identity transformations.
+    """
+
+    # Sort physical calibration keys to make random selection reproducible.
+    calibration_keys = tuple(sorted({metadata.calibration_key for metadata in window.metadata.values()}))
+    reference = window.current_calibration[calibration_keys[0]].transform
+    batch_size, device, dtype = reference.shape[0], reference.device, reference.dtype
+
+    # By default, every physical sensor is independently randomized.
+    sensor_count = len(calibration_keys) if config.sensors_per_window is None else config.sensors_per_window
+
+    if sensor_count > len(calibration_keys):
+        raise ValueError(f"sensors_per_window={sensor_count} exceeds the {len(calibration_keys)} physical sensors in this window.")
+
+    # Every calibration key must share the same batch representation.
+    for key in calibration_keys:
+        transform = window.current_calibration[key].transform
+        if transform.shape[0] != batch_size or transform.device != device or transform.dtype != dtype:
+            raise ValueError("All calibration states must share batch size, device and dtype.")
+
+    # A separate random permutation for each batch item.
+    # The first sensor_count positions are selected without replacement.
+    selection_ranks = torch.rand(batch_size, len(calibration_keys), device=device, generator=generator).argsort(dim=1).argsort(dim=1)
+    window_enabled = torch.rand(batch_size, 1, device=device, generator=generator) < config.probability
+    selected = (selection_ranks < sensor_count) & window_enabled
 
     frame_randomization_by_key: dict[str, torch.Tensor] = {}
 
-    for calibration_key in calibration_keys:
-        state = window.current_calibration[calibration_key]
+    for sensor_index, calibration_key in enumerate(calibration_keys):
+        # Begin with an identity rotation for every batch item.
+        R = torch.eye(3, device=device, dtype=dtype).expand(batch_size, 3, 3).clone()
 
-        batch_size = state.transform.shape[0]
-        device = state.transform.device
-        dtype = state.transform.dtype
+        if config.rotation is None and config.translation is None:
+            # Backward-compatible case: unrestricted Haar-uniform SO(3).
+            R = sample_uniform_so3(batch_size=batch_size, device=device, dtype=dtype, generator=generator)
 
-        R = sample_uniform_so3(
-            batch_size=batch_size,
-            device=device,
-            dtype=dtype,
-            generator=generator,
-        )
+        elif config.rotation is not None:
+            # Sample an isotropic axis and a bounded rotation-vector magnitude.
+            delta_phi = sample_isotropic_perturbation(config=config.rotation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
+            R = so3_exp(delta_phi)
 
-        A = torch.zeros(
-            batch_size,
-            4,
-            4,
-            device=device,
-            dtype=dtype,
-        )
+        # Translation is optional and is expressed in the original sensor frame.
+        t = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+        translation_enabled = config.translation is not None and (config.translation_keys is None or calibration_key in config.translation_keys)
 
-        A[..., :3, :3] = R
-        A[..., 3, 3] = 1.0
+        if translation_enabled:
+            # Translating an IMU coordinate origin requires additional acceleration terms.
+            # Reject that operation rather than creating inconsistent IMU measurements.
+            has_vector_stream = any(window.metadata[stream_key].calibration_key == calibration_key and window.metadata[stream_key].geometry_type == GeometryType.VECTOR for stream_key in window.streams)
 
-        frame_randomization_by_key[calibration_key] = A
+            if has_vector_stream and bool(selected[:, sensor_index].any()):
+                raise ValueError(f"Cannot translate IMU/VECTOR frame {calibration_key!r} without lever-arm acceleration compensation.")
+
+            t = sample_isotropic_perturbation(config=config.translation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
+
+        # Construct A_S = [R, t; 0, 1].
+        A = torch.eye(4, device=device, dtype=dtype).expand(batch_size, 4, 4).clone()
+        A[:, :3, :3] = R
+        A[:, :3, 3] = t
+
+        # Only selected sensor keys receive the sampled transformation.
+        # All other keys get an exact identity, preserving raw data unchanged.
+        frame_randomization_by_key[calibration_key] = torch.where(selected[:, sensor_index, None, None], A, torch.eye(4, device=device, dtype=dtype))
 
     return frame_randomization_by_key
+
 
 
 def _randomize_calibration(
@@ -213,6 +247,9 @@ def _reexpress_measurements(
         if measurements.ndim != 3 or measurements.shape[-1] != 3:
             raise ValueError("VECTOR measurements must have shape [B, N, 3].")
 
+        if bool((torch.linalg.vector_norm(frame_randomization[:, :3, 3], dim=-1) > 1e-10).any()):
+            raise ValueError("Translating an IMU measurement frame requires lever-arm compensation.")
+
         return measurements @ R
 
     if geometry_type == GeometryType.SO3:
@@ -229,7 +266,7 @@ def _reexpress_measurements(
             raise ValueError("SE3 measurements must have shape [B, N, 4, 4].")
 
         A = frame_randomization[:, None]
-        A_inverse = _inverse_rotation_only_se3(frame_randomization)[:, None]
+        A_inverse = torch.linalg.inv(frame_randomization)[:, None]
 
         return A_inverse @ measurements @ A
 
