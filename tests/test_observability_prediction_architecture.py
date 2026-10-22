@@ -76,7 +76,7 @@ def make_model_tokens(batch_size: int = 2) -> TokenBatch:
     x = torch.randn((batch_size, 6, 8), dtype=torch.float32)
     token_mask = torch.ones((batch_size, 6), dtype=torch.bool)
     calibration_ids = torch.tensor([[0, 0, 0, 1, 1, 1]], dtype=torch.long).repeat(batch_size, 1)
-    return TokenBatch(x=x, token_mask=token_mask, calibration_ids=calibration_ids)
+    return TokenBatch(x=x, token_mask=token_mask, calibration_ids=calibration_ids, calibration_keys=("imu", "lidar"),)
 
 
 def test_collate_windows_preserves_dataset_indices() -> None:
@@ -94,6 +94,7 @@ def test_sort_measurement_sequence_preserves_calibration_id_alignment() -> None:
         timestamps=torch.tensor([[2.0, 0.0, 1.0]], dtype=torch.float32),
         token_mask=torch.tensor([[True, True, True]]),
         calibration_ids=torch.tensor([[0, 1, 0]], dtype=torch.long),
+        calibration_keys=("imu", "lidar"),
     )
 
     sorted_measurements = sort_measurement_sequence(measurements)
@@ -176,6 +177,7 @@ def test_observability_prediction_model_rejects_missing_calibration_tokens() -> 
         x=torch.randn((2, 4, 8)),
         token_mask=torch.ones((2, 4), dtype=torch.bool),
         calibration_ids=torch.zeros((2, 4), dtype=torch.long),
+        calibration_keys=("imu", "lidar"),
     )
 
     with pytest.raises(ValueError, match="lidar"):
