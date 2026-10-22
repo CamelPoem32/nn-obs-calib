@@ -59,20 +59,23 @@ class PooledCalibrationModel(nn.Module):
 
         return torch.stack(context_rows, dim=1)
 
-    def forward(self, tokens: TokenBatch, calibration_context: Mapping[str, torch.Tensor] | None = None) -> ModelOutput:
-        tokens.validate()
+    def encode_calibration_features(self, tokens: TokenBatch, calibration_context: Mapping[str, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return shared [B, C, H] features and optional stacked numeric context.
 
+        This method factors out the unchanged checkpoint-compatible backbone so
+        regression and flow-matching heads use exactly the same token routing.
+        """
+
+        tokens.validate()
         if tokens.calibration_ids is None or not tokens.calibration_keys:
             raise ValueError("PooledCalibrationModel requires calibration routing metadata.")
 
         batch_size = tokens.x.shape[0]
         stacked_context = self._stack_calibration_context(tokens, calibration_context, batch_size)
-
         transformer_output = self.transformer_encoder(tokens)
 
         # Measurement tokens occupy the first N positions in the current encoder.
         encoded_measurements = transformer_output.sequence[:, :tokens.x.shape[1]]
-
         pooled = self.pooler(
             encoded_measurements,
             tokens.token_mask,
@@ -82,19 +85,27 @@ class PooledCalibrationModel(nn.Module):
         )
 
         batch_size, num_calibrations, pooled_dim = pooled.shape
-        flat_pooled = pooled.reshape(batch_size * num_calibrations, pooled_dim)
-        flat_shared = self.mlp_body(flat_pooled)
-        shared = flat_shared.reshape(batch_size, num_calibrations, -1)
+        flat_shared = self.mlp_body(pooled.reshape(batch_size * num_calibrations, pooled_dim))
+        return flat_shared.reshape(batch_size, num_calibrations, -1), stacked_context
 
+    def flatten_head_context(self, shared_features: torch.Tensor, stacked_context: torch.Tensor | None) -> torch.Tensor:
+        """Return [B*C, head_context_dim], retaining the original head contract."""
+
+        batch_size, num_calibrations, _ = shared_features.shape
         if self.config.head.calibration_context_dim > 0:
-            flat_context = stacked_context.reshape(batch_size * num_calibrations, self.config.head.calibration_context_dim)
-        else:
-            flat_context = flat_shared.new_empty((batch_size * num_calibrations, 0))
+            if stacked_context is None:
+                raise ValueError("Head calibration context is enabled, but no context was supplied.")
+            return stacked_context[..., :self.config.head.calibration_context_dim].reshape(batch_size * num_calibrations, self.config.head.calibration_context_dim)
+        return shared_features.new_empty((batch_size * num_calibrations, 0))
 
+    def forward(self, tokens: TokenBatch, calibration_context: Mapping[str, torch.Tensor] | None = None) -> ModelOutput:
+        shared, stacked_context = self.encode_calibration_features(tokens, calibration_context)
+        batch_size, num_calibrations, shared_dim = shared.shape
+        flat_shared = shared.reshape(batch_size * num_calibrations, shared_dim)
+        flat_context = self.flatten_head_context(shared, stacked_context)
         flat_prediction = self.head(flat_shared, flat_context)
 
         predictions = {}
-
         for calibration_id, calibration_key in enumerate(tokens.calibration_keys):
             predictions[calibration_key] = CalibrationPrediction(
                 change_event_logit=flat_prediction.change_event_logit.reshape(batch_size, num_calibrations, 1)[:, calibration_id],
@@ -104,3 +115,6 @@ class PooledCalibrationModel(nn.Module):
             )
 
         return ModelOutput(predictions=predictions, shared_features=shared)
+
+
+__all__ = ["PooledCalibrationModel"]

@@ -274,3 +274,155 @@ class PooledCalibrationModelConfig:
 
         if len(active_context_dims) > 1:
             raise ValueError("Pooler and head calibration_context_dim must match when both use calibration context.")
+
+# ---------------------------------------------------------------------------
+# Deterministic calibration-correction Flow Matching
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CalibrationFlowHeadSettings:
+    """Additional FM-head settings; hidden layers are inherited from the pooled head.
+
+    State coordinates use the repository's [rotation (rad), translation (m)]
+    Lie-algebra ordering, followed by the time-offset correction in seconds.
+    These scales normalize *inputs*, not the physical output velocities.
+    """
+
+    rotation_state_scale_rad: float = 1.0
+    translation_state_scale_m: float = 0.1
+    time_offset_state_scale_s: float = 0.25
+    initialize_state_time_independent: bool = True
+
+    def __post_init__(self) -> None:
+        import math
+
+        for name in ("rotation_state_scale_rad", "translation_state_scale_m", "time_offset_state_scale_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive, got {value}.")
+        if not isinstance(self.initialize_state_time_independent, bool):
+            raise ValueError("initialize_state_time_independent must be boolean.")
+
+
+@dataclass(frozen=True)
+class CalibrationFlowIntegratorConfig:
+    """Deterministic SE(3) x R Lie integration and step-count ablation settings."""
+
+    num_steps: int = 8
+    method: str = "midpoint"
+    ablation_steps: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.num_steps, bool) or not isinstance(self.num_steps, int) or self.num_steps <= 0:
+            raise ValueError("num_steps must be a positive integer.")
+        if self.method not in ("euler", "midpoint"):
+            raise ValueError("method must be 'euler' or 'midpoint'.")
+        if not self.ablation_steps or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in self.ablation_steps):
+            raise ValueError("ablation_steps must be a nonempty tuple of positive integers.")
+        if len(set(self.ablation_steps)) != len(self.ablation_steps):
+            raise ValueError("ablation_steps must be unique.")
+
+    def num_field_evaluations(self, *, steps: int | None = None) -> int:
+        """Nominal cost for the configured fixed-step integration scheme."""
+
+        count = self.num_steps if steps is None else steps
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("steps must be a positive integer.")
+        return count * (2 if self.method == "midpoint" else 1)
+
+
+@dataclass(frozen=True)
+class CalibrationFlowLossConfig:
+    """Velocity-MSE normalization matching the initial notebook-42 scales.
+
+    The source of truth for the loss *implementation* is
+    ``obscalib.flow_matching.loss.calibration_velocity_loss``. Conversion to
+    its weights object is explicit and lazy to avoid importing torch/geometry
+    while loading the architecture configuration.
+    """
+
+    rotation_scale_rad: float = 0.08726646259971647  # 5 degrees
+    translation_scale_m: float = 0.05
+    time_offset_scale_s: float = 0.05
+    rotation_weight: float = 2.0
+    translation_weight: float = 1.0
+    time_offset_weight: float = 1.0
+    active_rotation_weight: float = 0.0
+    active_rotation_threshold_rad: float = 1e-6
+
+    def __post_init__(self) -> None:
+        import math
+
+        for name in ("rotation_scale_rad", "translation_scale_m", "time_offset_scale_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive, got {value}.")
+        for name in ("rotation_weight", "translation_weight", "time_offset_weight", "active_rotation_weight", "active_rotation_threshold_rad"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative, got {value}.")
+
+    def to_loss_weights(self):
+        """Return the exact weights type accepted by calibration_velocity_loss."""
+
+        from obscalib.flow_matching.loss import CalibrationFlowLossWeights
+
+        return CalibrationFlowLossWeights(
+            rotation_scale_rad=self.rotation_scale_rad,
+            translation_scale_m=self.translation_scale_m,
+            time_offset_scale_s=self.time_offset_scale_s,
+            rotation_weight=self.rotation_weight,
+            translation_weight=self.translation_weight,
+            time_offset_weight=self.time_offset_weight,
+            active_rotation_weight=self.active_rotation_weight,
+            active_rotation_threshold_rad=self.active_rotation_threshold_rad,
+        )
+
+
+@dataclass(frozen=True)
+class PooledCalibrationFlowConfig:
+    """FM experiment configuration wrapping the existing pooled backbone.
+
+    This is intentionally a companion to PooledCalibrationModelConfig rather
+    than a replacement. To preserve checkpoint compatibility, construct the
+    flow model using::
+
+        flow_config = PooledCalibrationFlowConfig(backbone=old_model_config)
+        model = PooledCalibrationFlowModel(flow_config.backbone, **flow_config.model_kwargs())
+
+    Initialize the shared feature extractor from a pretrained regression model
+    separately; ``freeze_backbone_initially`` records that training-stage choice.
+    The prior-perturbation distribution (0-60 degrees initially) continues to be
+    configured by the augmentation pipeline, not by this model config.
+    """
+
+    backbone: PooledCalibrationModelConfig
+    head: CalibrationFlowHeadSettings = field(default_factory=CalibrationFlowHeadSettings)
+    integrator: CalibrationFlowIntegratorConfig = field(default_factory=CalibrationFlowIntegratorConfig)
+    loss: CalibrationFlowLossConfig = field(default_factory=CalibrationFlowLossConfig)
+    freeze_backbone_initially: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backbone, PooledCalibrationModelConfig):
+            raise TypeError("backbone must be a PooledCalibrationModelConfig.")
+        if not isinstance(self.head, CalibrationFlowHeadSettings):
+            raise TypeError("head must be a CalibrationFlowHeadSettings.")
+        if not isinstance(self.integrator, CalibrationFlowIntegratorConfig):
+            raise TypeError("integrator must be a CalibrationFlowIntegratorConfig.")
+        if not isinstance(self.loss, CalibrationFlowLossConfig):
+            raise TypeError("loss must be a CalibrationFlowLossConfig.")
+        if not isinstance(self.freeze_backbone_initially, bool):
+            raise TypeError("freeze_backbone_initially must be boolean.")
+
+    def model_kwargs(self) -> dict[str, int | float | bool | str]:
+        """Constructor kwargs for the existing PooledCalibrationFlowModel API."""
+
+        return {
+            "integration_steps": self.integrator.num_steps,
+            "integration_method": self.integrator.method,
+            "rotation_state_scale_rad": self.head.rotation_state_scale_rad,
+            "translation_state_scale_m": self.head.translation_state_scale_m,
+            "time_offset_state_scale_s": self.head.time_offset_state_scale_s,
+            "initialize_state_time_independent": self.head.initialize_state_time_independent,
+        }
