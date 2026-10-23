@@ -163,7 +163,11 @@ class PooledCalibrationFlowModel(PooledCalibrationModel):
         flow_batch.target_velocity using calibration_velocity_loss.
         """
 
-        shared, stacked_context = self.encode_calibration_features(tokens, calibration_context)
+        if self.feature_extractor_frozen:
+            with torch.no_grad():
+                shared, stacked_context = self.encode_calibration_features(tokens, calibration_context)
+        else:
+            shared, stacked_context = self.encode_calibration_features(tokens, calibration_context)
         batch_size, num_calibrations, _ = shared.shape
         keys = tuple(tokens.calibration_keys)
         missing_xi = [key for key in keys if key not in target_delta_xi]
