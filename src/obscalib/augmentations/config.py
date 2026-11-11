@@ -13,7 +13,7 @@ from obscalib.data.structures import MeasurementType
 class PerturbationDistribution(str, Enum):
     """Distribution used to sample a nonnegative perturbation magnitude."""
 
-    # Sample the magnitude uniformly from [0, maximum].
+    # Sample the magnitude uniformly from [minimum, maximum].
     UNIFORM = "uniform"
 
     # Sample the absolute value of a zero-mean Gaussian and truncate it at maximum.
@@ -27,12 +27,15 @@ class PerturbationDistribution(str, Enum):
 class PerturbationMagnitudeConfig:
     """Configuration for a bounded perturbation magnitude.
 
-    UNIFORM samples a magnitude directly from [0, maximum].
+    UNIFORM samples a magnitude directly from [minimum, maximum].
 
     TRUNCATED_NORMAL and TRUNCATED_STUDENT_T use `scale` as the typical
     perturbation magnitude and truncate the sampled magnitude at `maximum`.
 
     `degrees_of_freedom` is used only by TRUNCATED_STUDENT_T.
+
+    `minimum` is used only by UNIFORM. Its default of 0.0 preserves all
+    previously configured augmentation distributions and random sampling.
     """
 
     # Hard upper bound on the sampled nonnegative perturbation magnitude.
@@ -49,9 +52,19 @@ class PerturbationMagnitudeConfig:
     # Smaller values produce heavier tails. It is unused by other distributions.
     degrees_of_freedom: int = 3
 
+    # Inclusive lower bound of the UNIFORM magnitude interval.
+    # Placed last to preserve positional-constructor compatibility.
+    minimum: float = 0.0
+
     def __post_init__(self) -> None:
         if not math.isfinite(self.maximum) or self.maximum <= 0.0:
             raise ValueError("maximum must be finite and positive.")
+
+        if not math.isfinite(self.minimum) or self.minimum < 0.0 or self.minimum > self.maximum:
+            raise ValueError("minimum must be finite and satisfy 0 <= minimum <= maximum.")
+
+        if self.distribution != PerturbationDistribution.UNIFORM and self.minimum != 0.0:
+            raise ValueError("A nonzero minimum is currently supported only for UNIFORM perturbations.")
 
         if self.scale is not None and (not math.isfinite(self.scale) or self.scale <= 0.0):
             raise ValueError("scale must be finite and positive when provided.")

@@ -94,7 +94,7 @@ def sample_perturbation_magnitudes(
     The distributions are interpreted as:
 
         UNIFORM:
-            magnitude ~ Uniform(0, maximum)
+            magnitude ~ Uniform(minimum, maximum)
 
         TRUNCATED_NORMAL:
             magnitude ~ |Normal(0, scale)| conditioned on magnitude <= maximum
@@ -109,7 +109,7 @@ def sample_perturbation_magnitudes(
     _validate_generator(generator)
 
     if config.distribution == PerturbationDistribution.UNIFORM:
-        return config.maximum * torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator)
+        return config.minimum + (config.maximum - config.minimum) * torch.rand(batch_size, 1, device=device, dtype=dtype, generator=generator)
 
     if config.distribution == PerturbationDistribution.TRUNCATED_NORMAL:
         return _sample_truncated_half_normal(
