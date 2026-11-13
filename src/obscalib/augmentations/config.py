@@ -157,9 +157,16 @@ class PriorPerturbationConfig:
     one_rotation_axis_per_sample: bool = False
     one_perturbation_type_per_sample: bool = False
 
+    # Restrict the rotational prior-fault axis to selected common/body axes.
+    # (True, False, False) makes X-only faults. All three True preserves legacy draws.
+    # The axis mask affects prior rotation only, not true sensor-frame randomization.
+    rotation_axes: tuple[bool, bool, bool] = (True, True, True)
+
     def __post_init__(self) -> None:
         _validate_probability("probability", self.probability)
         _validate_probability_map("probability_by_key", self.probability_by_key)
+        if not isinstance(self.rotation_axes, tuple) or len(self.rotation_axes) != 3 or not all(type(active) is bool for active in self.rotation_axes) or not any(self.rotation_axes):
+            raise ValueError("prior_perturbation.rotation_axes must contain three booleans with at least one enabled axis.")
 
         if self.enabled and self.rotation is None and self.translation is None and self.time_offset is None:
             raise ValueError("Enabled prior perturbation requires at least one perturbation magnitude config.")

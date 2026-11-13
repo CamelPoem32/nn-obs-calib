@@ -268,26 +268,39 @@ class CalibrationPriorPerturber:
         return prior_state, perturbation_xi, delta_tau
 
     def _sample_rotation_perturbation(self, batch_size: int, device: torch.device, dtype: torch.dtype, generator: torch.Generator | None) -> torch.Tensor:
-        """
-        Sample either an arbitrary tangent-space rotation or one random axis.
+        """Sample rotation faults in the configured Cartesian-axis subspace.
 
-        The one-axis mode samples both the axis and signed angle independently
-        for every batch item.
+        The original, all-axes branch is unchanged for backward-compatible RNG
+        behavior. A single enabled axis samples signed magnitudes on that axis;
+        more than one allowed axis can be sampled isotropically in their subspace.
         """
-
         if self.config.rotation is None:
             raise RuntimeError("Rotation perturbation requested without rotation configuration.")
 
-        if not self.config.one_rotation_axis_per_sample:
+        allowed_axes = [i for i, enabled in enumerate(self.config.rotation_axes) if enabled]
+        if not self.config.one_rotation_axis_per_sample and len(allowed_axes) == 3:
             return sample_isotropic_perturbation(config=self.config.rotation, batch_size=batch_size, dimension=3, device=device, dtype=dtype, generator=generator)
 
-        selected_axes = torch.randint(low=0, high=3, size=(batch_size, 1), device=device, generator=generator)
-        signed_angles = sample_signed_scalar_perturbation(config=self.config.rotation, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+        if self.config.one_rotation_axis_per_sample:
+            if len(allowed_axes) == 3:
+                selected_axes = torch.randint(low=0, high=3, size=(batch_size, 1), device=device, generator=generator)
+            elif len(allowed_axes) == 1:
+                selected_axes = torch.full((batch_size, 1), allowed_axes[0], device=device, dtype=torch.long)
+            else:
+                choices = torch.as_tensor(allowed_axes, device=device, dtype=torch.long)
+                selected_axes = choices[torch.randint(len(choices), (batch_size, 1), device=device, generator=generator)]
+            signed_angles = sample_signed_scalar_perturbation(config=self.config.rotation, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+            result = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+            result.scatter_(dim=1, index=selected_axes, src=signed_angles)
+            return result
 
-        delta_phi = torch.zeros(batch_size, 3, device=device, dtype=dtype)
-        delta_phi.scatter_(dim=1, index=selected_axes, src=signed_angles)
-
-        return delta_phi
+        # Continuous isotropic directions within a restricted axis subspace.
+        result = torch.zeros(batch_size, 3, device=device, dtype=dtype)
+        if len(allowed_axes) == 1:
+            result[:, allowed_axes[0]:allowed_axes[0] + 1] = sample_signed_scalar_perturbation(config=self.config.rotation, batch_size=batch_size, device=device, dtype=dtype, generator=generator)
+        else:
+            result[:, allowed_axes] = sample_isotropic_perturbation(config=self.config.rotation, batch_size=batch_size, dimension=len(allowed_axes), device=device, dtype=dtype, generator=generator)
+        return result
 
     def _sample_perturbation_type_masks(
         self,
