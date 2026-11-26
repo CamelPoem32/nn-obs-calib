@@ -19,11 +19,17 @@ _IMU_MEASUREMENT_TYPES = {
 
 class SamplingRateAugmenter:
     """
-    Randomly reduce IMU and LiDAR sampling rates.
+    Reduce IMU and LiDAR sampling rates within optional configured bounds.
 
-    IMU measurements are linearly interpolated onto a regular lower-frequency grid. Gyroscope and accelerometer streams sharing one calibration key use the same sampled target frequency.
+    For each modality, target frequencies are sampled between its minimum and
+    maximum (or source frequency if no maximum is configured). Equal bounds
+    request a fixed target frequency. Sources slower than the requested target
+    are left unchanged: this augmenter never upsamples.
 
-    LiDAR relative SE3 measurements are reduced by selecting a lower-rate sequence of retained scans and composing all original relative transforms between consecutive retained scans.
+    IMU measurements are linearly interpolated onto a regular lower-frequency
+    grid. Gyroscope and accelerometer streams sharing a calibration key use the
+    same target frequency. LiDAR relative SE3 measurements are reduced by
+    retaining scans and composing the intervening relative transforms.
     """
 
     def __init__(self, config: SamplingRateAugmentationConfig) -> None:
@@ -69,7 +75,7 @@ class SamplingRateAugmenter:
                 continue
 
             if _is_lidar_stream(metadata) and self.config.minimum_lidar_frequency_hz is not None:
-                augmented_stream, target_frequency_hz, applied = _augment_lidar_stream(stream, minimum_frequency_hz=self.config.minimum_lidar_frequency_hz, probability=self.config.lidar_probability, generator=generator)
+                augmented_stream, target_frequency_hz, applied = _augment_lidar_stream(stream, minimum_frequency_hz=self.config.minimum_lidar_frequency_hz, probability=self.config.lidar_probability, generator=generator, maximum_frequency_hz=self.config.maximum_lidar_frequency_hz)
 
                 augmented_streams[stream_key] = augmented_stream
                 target_frequency_hz_by_stream[stream_key] = target_frequency_hz
@@ -124,16 +130,23 @@ class SamplingRateAugmenter:
                 if not source_frequencies:
                     continue
 
-                # A shared target must not exceed the slowest stream belonging to
-                # this physical IMU.
-                maximum_target_frequency_hz = min(source_frequencies)
+                # A shared target cannot exceed the slowest stream belonging
+                # to this physical IMU. Do not attempt to upsample either stream.
+                source_limit_hz = min(source_frequencies)
 
-                if self.config.minimum_imu_frequency_hz >= maximum_target_frequency_hz:
+                if self.config.minimum_imu_frequency_hz >= source_limit_hz:
+                    continue
+
+                configured_maximum_hz = self.config.maximum_imu_frequency_hz
+                maximum_target_frequency_hz = min(source_limit_hz, configured_maximum_hz) if configured_maximum_hz is not None else source_limit_hz
+
+                if maximum_target_frequency_hz < self.config.minimum_imu_frequency_hz:
                     continue
 
                 if not _sample_probability(self.config.imu_probability, generator):
                     continue
 
+                # Equal bounds intentionally select the exact fixed frequency.
                 targets[batch_index] = _sample_uniform(self.config.minimum_imu_frequency_hz, maximum_target_frequency_hz, generator)
 
             target_frequency_by_key[calibration_key] = targets
@@ -189,7 +202,7 @@ def _augment_imu_stream(stream: SensorStreamBatch, target_frequencies: list[floa
     return _pack_samples(samples), target_frequency_record, applied_record
 
 
-def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: float, probability: float, generator: torch.Generator | None) -> tuple[SensorStreamBatch, torch.Tensor, torch.Tensor]:
+def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: float, probability: float, generator: torch.Generator | None, maximum_frequency_hz: float | None = None) -> tuple[SensorStreamBatch, torch.Tensor, torch.Tensor]:
     """Reduce one relative SE3 LiDAR stream while preserving at least two valid relative measurements per batch item."""
 
     stream.validate()
@@ -225,7 +238,14 @@ def _augment_lidar_stream(stream: SensorStreamBatch, *, minimum_frequency_hz: fl
             samples.append((values, end_timestamps, start_timestamps))
             continue
 
-        target_frequency = _sample_uniform(minimum_frequency_hz, source_frequency, generator)
+        maximum_target_frequency_hz = min(source_frequency, maximum_frequency_hz) if maximum_frequency_hz is not None else source_frequency
+
+        if maximum_target_frequency_hz < minimum_frequency_hz:
+            samples.append((values, end_timestamps, start_timestamps))
+            continue
+
+        # Equal bounds intentionally select the exact fixed target frequency.
+        target_frequency = _sample_uniform(minimum_frequency_hz, maximum_target_frequency_hz, generator)
 
         reduced_values, reduced_end_timestamps, reduced_start_timestamps = _reduce_relative_se3_scan_rate(values, start_timestamps, end_timestamps, target_frequency)
 

@@ -378,11 +378,18 @@ class SamplingRateAugmentationConfig:
     """
     Sampling-rate augmentation for IMU and relative LiDAR measurements.
 
-    IMU streams are linearly resampled onto a regular grid whose frequency is sampled uniformly between minimum_imu_frequency_hz and the current source frequency.
+    Target frequencies are sampled uniformly between the configured minimum and
+    maximum for each modality. A None maximum retains the original behavior of
+    sampling up to the estimated source frequency. In every case, the source
+    frequency limits the target: this augmentation never upsamples measurements.
 
-    Gyroscope and accelerometer streams sharing one calibration key receive the same sampled target frequency.
+    Setting a modality's minimum and maximum to the same positive value requests
+    that fixed target frequency, provided the source is faster. With LiDAR, scan
+    retention is discrete, so the achieved frequency may only approximate it.
 
-    Relative LiDAR SE3 measurements are reduced by retaining a lower-rate subset of scan timestamps and composing all relative transforms spanning each retained interval.
+    Gyroscope and accelerometer streams sharing one calibration key receive the
+    same sampled target frequency. IMU measurements use linear interpolation;
+    relative LiDAR SE3 measurements retain scans and compose intervening poses.
     """
 
     enabled: bool = False
@@ -393,13 +400,24 @@ class SamplingRateAugmentationConfig:
     imu_probability: float = 1.0
     lidar_probability: float = 1.0
 
+    # Optional upper bounds. Kept after probability fields to preserve the
+    # positional arguments of pre-existing SamplingRateAugmentationConfig calls.
+    maximum_imu_frequency_hz: float | None = None
+    maximum_lidar_frequency_hz: float | None = None
+
     def __post_init__(self) -> None:
         _validate_probability("imu_probability", self.imu_probability)
         _validate_probability("lidar_probability", self.lidar_probability)
 
-        for name, frequency_hz in (("minimum_imu_frequency_hz", self.minimum_imu_frequency_hz), ("minimum_lidar_frequency_hz", self.minimum_lidar_frequency_hz)):
+        for name, frequency_hz in (("minimum_imu_frequency_hz", self.minimum_imu_frequency_hz), ("maximum_imu_frequency_hz", self.maximum_imu_frequency_hz), ("minimum_lidar_frequency_hz", self.minimum_lidar_frequency_hz), ("maximum_lidar_frequency_hz", self.maximum_lidar_frequency_hz)):
             if frequency_hz is not None and (not math.isfinite(frequency_hz) or frequency_hz <= 0.0):
                 raise ValueError(f"{name} must be finite and positive when configured.")
+
+        for modality, minimum, maximum in (("imu", self.minimum_imu_frequency_hz, self.maximum_imu_frequency_hz), ("lidar", self.minimum_lidar_frequency_hz, self.maximum_lidar_frequency_hz)):
+            if maximum is not None and minimum is None:
+                raise ValueError(f"maximum_{modality}_frequency_hz requires minimum_{modality}_frequency_hz.")
+            if minimum is not None and maximum is not None and maximum < minimum:
+                raise ValueError(f"maximum_{modality}_frequency_hz must be at least minimum_{modality}_frequency_hz.")
 
         if not self.enabled:
             return
