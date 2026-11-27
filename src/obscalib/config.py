@@ -426,3 +426,49 @@ class PooledCalibrationFlowConfig:
             "time_offset_state_scale_s": self.head.time_offset_state_scale_s,
             "initialize_state_time_independent": self.head.initialize_state_time_independent,
         }
+
+
+# ---------------------------------------------------------------------------
+# Numerical/learned late feature fusion
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NumericalEncoderConfig:
+    """Shared numerical pair encoder; final linear layer starts at zero."""
+    hidden_dim: int = 64
+    output_dim: int = 64
+    zero_output_init: bool = True
+
+    def __post_init__(self) -> None:
+        _validate_positive('hidden_dim', self.hidden_dim)
+        _validate_positive('output_dim', self.output_dim)
+
+
+@dataclass(frozen=True)
+class CalibrationFeatureFusionConfig:
+    """GELU fusion MLP; width defaults to twice the neural feature dimension."""
+    hidden_dim: int | None = None
+    numerical_init_scale: float = 0.1
+    identity_init: bool = True
+
+    def __post_init__(self) -> None:
+        import math
+        if self.hidden_dim is not None:
+            _validate_positive('hidden_dim', self.hidden_dim)
+        if not math.isfinite(self.numerical_init_scale) or self.numerical_init_scale <= 0:
+            raise ValueError('numerical_init_scale must be finite and strictly positive.')
+
+
+@dataclass(frozen=True)
+class PooledCalibrationHybridConfig:
+    """Companion config preserving the original pooled 6D backbone contract."""
+    backbone: PooledCalibrationModelConfig
+    numerical_feature_dim: int = 15
+    numerical_encoder: NumericalEncoderConfig = field(default_factory=NumericalEncoderConfig)
+    fusion: CalibrationFeatureFusionConfig = field(default_factory=CalibrationFeatureFusionConfig)
+
+    def __post_init__(self) -> None:
+        _validate_positive('numerical_feature_dim', self.numerical_feature_dim)
+        if self.fusion.identity_init and self.fusion.hidden_dim is not None and self.fusion.hidden_dim < 2*self.backbone.mlp.output_dim:
+            raise ValueError('Identity initialization needs fusion.hidden_dim >= 2*backbone.mlp.output_dim.')

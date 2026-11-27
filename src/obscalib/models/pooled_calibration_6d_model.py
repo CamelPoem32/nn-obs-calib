@@ -43,12 +43,16 @@ class PooledCalibration6DModel(PooledCalibrationModel):
 
     def forward(self, tokens: TokenBatch, calibration_context: Mapping[str, torch.Tensor] | None = None) -> PooledCalibration6DOutput:
         shared, stacked_context = self.encode_calibration_features(tokens, calibration_context)
+        return self.decode_calibration_features(shared, stacked_context, tokens.calibration_keys)
+
+    def decode_calibration_features(self, shared: torch.Tensor, stacked_context: torch.Tensor | None, calibration_keys: tuple[str, ...]) -> PooledCalibration6DOutput:
+        """Apply the original shared 6D head to calibration-wise features."""
         batch_size, num_calibrations, shared_dim = shared.shape
         flat_shared = shared.reshape(batch_size * num_calibrations, shared_dim)
         flat_context = self.flatten_head_context(shared, stacked_context)
         flat_prediction = self.head_6d(flat_shared, flat_context)
         predictions = {}
-        for calibration_id, calibration_key in enumerate(tokens.calibration_keys):
+        for calibration_id, calibration_key in enumerate(calibration_keys):
             predictions[calibration_key] = Calibration6DPrediction(
                 rotation_6d=flat_prediction.rotation_6d.reshape(batch_size, num_calibrations, 6)[:, calibration_id],
                 delta_translation=flat_prediction.delta_translation.reshape(batch_size, num_calibrations, 3)[:, calibration_id],

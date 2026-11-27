@@ -20,3 +20,9 @@ __all__ = [
     "CalibrationPrediction",
     "ModelOutput",
 ]
+
+from obscalib.models.numerical_encoder import NumericalEncoder
+from obscalib.models.calibration_feature_fusion import CalibrationFeatureFusion
+from obscalib.models.pooled_calibration_hybrid_model import PooledCalibrationHybridModel
+
+__all__ += ['NumericalEncoder','CalibrationFeatureFusion','PooledCalibrationHybridModel']
